@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ITO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+ITO_MODES=("$@")
+if [[ ${#ITO_MODES[@]} == 0 ]]; then ITO_MODES=(debug release); fi
+for mode in "${ITO_MODES[@]}"; do
+  case "$mode" in
+    debug|release) ;;
+    *) printf 'Usage: scripts/test.sh [debug|release ...]\n' >&2; exit 2 ;;
+  esac
+done
 ITO_WORK="$(mktemp -d)"
 ITO_WORK="$(cd "$ITO_WORK" && pwd -P)"
 trap 'rm -r -- "$ITO_WORK"' EXIT
@@ -10,7 +18,7 @@ cc -std=c11 -Wall -Wextra -Werror "$ITO_ROOT/tests/fs_process.c" "$ITO_WORK/fs.o
 "$ITO_WORK/fs-process" "$ITO_WORK/process.lock"
 export NERI_LIBRARY_PATH="$ITO_WORK${NERI_LIBRARY_PATH:+:$NERI_LIBRARY_PATH}"
 "$ITO_ROOT/tests/snapshot-fixtures.sh" "$ITO_WORK/fixtures"
-for mode in debug release; do
+for mode in "${ITO_MODES[@]}"; do
   set --
   if [[ "$mode" == release ]]; then set -- --release; fi
   for suite in json manifest snapshot fs store cache_race graph views; do

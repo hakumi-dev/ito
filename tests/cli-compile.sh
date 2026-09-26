@@ -88,11 +88,16 @@ if [[ "$ITO_MODE" == release ]]; then set -- --release; fi
 "$ITO_EXE" --project "$ITO_APP" test "$@" | rg -F 'Ito compiled execution passed'
 cmp "$ITO_APP/ito.lock" "$ITO_CASE/original.lock"
 # Transitive origin edits remain invisible until an explicit update.
-sed -i '' 's/return 7/return 9/' "$ITO_CASE/leaf/src/library.hk"
+sed 's/return 7/return 9/' "$ITO_CASE/leaf/src/library.hk" > "$ITO_CASE/edited-source.hk"
+cat "$ITO_CASE/edited-source.hk" > "$ITO_CASE/leaf/src/library.hk"
 "$ITO_EXE" --project "$ITO_APP" run "$@" | rg -F 'Ito compiled execution passed'
 cmp "$ITO_APP/ito.lock" "$ITO_CASE/original.lock"
 "$ITO_EXE" --project "$ITO_APP" update middle
-sed -i '' 's/value(), 12/value(), 14/' "$ITO_APP/main.hk" "$ITO_APP/tests/contracts.hk"
+for source in "$ITO_APP/main.hk" "$ITO_APP/tests/contracts.hk"; do
+  sed 's/value(), 12/value(), 14/' "$source" > "$ITO_CASE/edited-source.hk"
+  cat "$ITO_CASE/edited-source.hk" > "$source"
+done
+rm "$ITO_CASE/edited-source.hk"
 "$ITO_EXE" --project "$ITO_APP" run "$@" | rg -F 'Ito compiled execution passed'
 "$ITO_EXE" --project "$ITO_APP" test "$@" | rg -F 'Ito compiled execution passed'
 # Compiler selection reaches the actual compiler, without a shell command string.

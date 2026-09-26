@@ -15,6 +15,7 @@ compiler executable (default `neri`). From this checkout:
 | Install that executable | `./build/ito self-install` |
 | Command reference | `ito --help` |
 | Validate Debug and Release contracts | `scripts/test.sh` |
+| Validate one configuration | `scripts/test.sh debug` or `scripts/test.sh release` |
 
 `self-install` stores an executable under `~/.ito/tools/ito/<sha256>/ito` and
 activates `~/.local/bin/ito`; put `~/.local/bin` on `PATH`. `ITO_HOME` changes
