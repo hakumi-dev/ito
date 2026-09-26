@@ -1,0 +1,6 @@
+.neri/
+build/
+.DS_Store
+
+# Local development lessons
+/docs/lessons/

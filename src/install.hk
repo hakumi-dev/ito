@@ -1,0 +1,189 @@
+use host
+use files
+use crypto
+use buffers
+use tasks
+use console
+namespace ito
+
+@library("ito-os")
+@cabiImport("ito_executable")
+unsafe def nativeExecutable(output: Byte*, capacity: Int): Int
+end
+
+@library("ito-os")
+@cabiImport("ito_readlink")
+unsafe def nativeReadLink(path: Byte*, length: Int, output: Byte*, capacity: Int): Int
+end
+
+class NativePath
+  public value: String = ""
+  public error: Int = 0
+end
+
+def executableOrLink(link: String = ""): NativePath
+  let result = new NativePath()
+  let input = pathBytes(link)
+  if input == null
+    result.error = 22
+    return result
+  end
+  let output: Byte[] = tasks::generate(4096, 1) do |index|
+    return 0 as Byte
+  end
+  var length = -1
+  unsafe
+    borrow output as pointer
+      if link == ""
+        length = nativeExecutable(pointer, output.Length)
+      else
+        borrow input as source
+          length = nativeReadLink(source, input.Length, pointer, output.Length)
+        end
+      end
+    end
+  end
+  if length < 0
+    result.error = -length
+    return result
+  end
+  let buffer = buffers::ByteBuffer.create(4096)
+  if buffer != null && buffer.appendSlice(output, 0, length)
+    let text = buffer.text()
+    if text != null
+      result.value = text
+      return result
+    end
+  end
+  result.error = 22
+  return result
+end
+
+def bytesHash(bytes: Byte[]): String?
+  let digest = crypto::sha256(bytes).bytes()
+  if digest == null
+    return null
+  end
+  return crypto::encodeHex(digest)
+end
+
+def installedBinaryMatches(path: String, hash: String): Bool
+  let parent = files::Root.open(directoryName(path)).root
+  if parent == null
+    return false
+  end
+  let read = parent.readBytes("ito", 67108864)
+  let closed = parent.close()
+  let bytes = read.bytes
+  if bytes == null || read.failure != null || read.closeFailure != null || closed != null
+    return false
+  end
+  let actual = bytesHash(bytes)
+  return actual != null && actual == hash
+end
+
+def managedItoLink(path: String): Bool
+  let parts = pathParts(path)
+  let size = parts.Length
+  return size >= 4 && parts[size - 1] == "ito" && digestIdentity("sha256:" + parts[size - 2]) && parts[size - 3] == "ito" && parts[size - 4] == "tools"
+end
+
+def publishExecutable(home: String, bytes: Byte[], hash: String, nonce: String): String
+  let directory = home + "/tools/ito/" + hash
+  if fs(1, directory) != 0
+    return "cannot create installed executable directory"
+  end
+  let target = directory + "/ito"
+  let stage = directory + "/.stage-" + nonce
+  if fsBytes(2, stage, "", bytes) != 0
+    return "cannot stage installed executable"
+  end
+  var error = ""
+  if fs(10, stage) != 0
+    error = "cannot set executable permissions"
+  else
+    # An existing content address is verified instead of replaced.
+    fs(5, stage, target)
+    if !installedBinaryMatches(target, hash)
+      error = "installed executable is missing or corrupt: " + target
+    else if fs(10, target) != 0
+      error = "cannot make installed Ito executable"
+    end
+  end
+  if fs(6, stage) != 0
+    error = "cannot clean executable staging file: " + stage
+  end
+  return error
+end
+
+def installExecutable(home: String, bin: String): String
+  let entry = bin + "/ito"
+  let previous = executableOrLink(entry)
+  if previous.error == 0 && !managedItoLink(previous.value)
+    return "entry point is not an Ito installation; choose another bin directory: " + entry
+  end
+  if previous.error != 0 && previous.error != 2
+    return "entry point exists as another file or cannot be inspected: " + entry
+  end
+  let executable = executableOrLink()
+  if executable.error != 0
+    return "cannot locate the running Ito executable"
+  end
+  let read = files::readBytes(executable.value, 67108864)
+  let bytes = read.bytes
+  if bytes == null || read.failure != null || read.closeFailure != null
+    return "cannot read the running Ito executable"
+  end
+  let hash = bytesHash(bytes)
+  let random = crypto::randomBytes(16).bytes()
+  if hash == null || random == null
+    return "cannot identify executable installation"
+  end
+  let nonce = crypto::encodeHex(random)
+  if nonce == null
+    return "cannot encode installation staging identity"
+  end
+  let published = publishExecutable(home, bytes, hash, nonce)
+  if published != ""
+    return published
+  end
+  let target = home + "/tools/ito/" + hash + "/ito"
+  let stage = bin + "/.ito-link-" + nonce
+  if fs(11, target, stage) != 0
+    return "cannot stage Ito entry point"
+  end
+  if fs(12, stage, entry) != 0
+    fs(6, stage)
+    return "cannot activate Ito entry point"
+  end
+  console::println("Installed Ito: " + entry + "\nExecutable: " + target)
+  return ""
+end
+
+def selfInstall(binDirectory: String): String
+  let home = configuredHome()
+  if home == null
+    return "cannot resolve Ito installation storage"
+  end
+  var selected = binDirectory
+  if selected == ""
+    let userHome = host::environment("HOME")
+    if userHome == null || userHome == ""
+      return "HOME is required for the default bin directory"
+    end
+    selected = userHome + "/.local/bin"
+  end
+  let bin = physicalPath(selected, true)
+  if bin == null || fs(1, bin) != 0
+    return "cannot prepare Ito bin directory"
+  end
+  let descriptor = lockProject(bin + "/.ito-install.lock")
+  if descriptor < 0
+    return "another installation holds the bin directory lock, or it cannot be opened"
+  end
+  var error = installExecutable(home, bin)
+  if unlockProject(descriptor) != 0 && error == ""
+    error = "cannot close installation lock"
+  end
+  return error
+end

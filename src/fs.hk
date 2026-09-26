@@ -1,0 +1,74 @@
+use host
+use buffers
+namespace ito
+
+@library("ito-os")
+@cabiImport("ito_fs")
+unsafe def nativeFs(operation: Int, path: Byte*, pathLength: Int, other: Byte*, otherLength: Int, data: Byte*, length: Int): Int
+end
+
+@library("ito-os")
+@cabiImport("ito_lock")
+unsafe def nativeLock(path: Byte*, length: Int): Int
+end
+
+@library("ito-os")
+@cabiImport("ito_unlock")
+unsafe def nativeUnlock(descriptor: Int): Int
+end
+
+def pathBytes(path: String): Byte[]?
+  let buffer = buffers::ByteBuffer.create(4096)
+  if buffer == null || !buffer.appendText(path)
+    return null
+  end
+  return buffer.snapshot()
+end
+
+def fsBytes(operation: Int, path: String, other: String, data: Byte[]): Int
+  let a = pathBytes(path)
+  let b = pathBytes(other)
+  if a == null || b == null
+    return 22
+  end
+  unsafe
+    borrow a as p
+      borrow b as q
+        borrow data as bytes
+          return nativeFs(operation, p, a.Length, q, b.Length, bytes, data.Length)
+        end
+      end
+    end
+  end
+end
+
+def fs(operation: Int, path: String, other: String = ""): Int
+  let empty: Byte[] = []
+  return fsBytes(operation, path, other, empty)
+end
+
+def writeAtomic(path: String, text: String): Int
+  let buffer = buffers::ByteBuffer.create(4194304)
+  if buffer == null || !buffer.appendText(text)
+    return 22
+  end
+  return fsBytes(3, path, "", buffer.snapshot())
+end
+
+def lockProject(path: String): Int
+  let bytes = pathBytes(path)
+  if bytes == null
+    return -22
+  end
+  unsafe
+    borrow bytes as pointer
+      return nativeLock(pointer, bytes.Length)
+    end
+  end
+end
+
+def unlockProject(descriptor: Int): Int
+  unsafe
+    return nativeUnlock(descriptor)
+  end
+end

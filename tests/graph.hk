@@ -1,0 +1,202 @@
+use ito
+use host
+use test
+use console
+
+def document(text: String): ito::Json
+  let parsed = ito::parseJson(text)
+  test::assertTrue(parsed != null)
+  if parsed != null
+    return parsed
+  end
+  return ito::jsonObject()
+end
+
+def library(path: String, name: String, dependencies: String = "{}", source: String = "# source\n"): Void
+  test::assertEqual(ito::fs(1, path + "/src"), 0)
+  let manifest = "{\"name\":" + ito::jsonQuote(name) + ",\"version\":\"0.1.0\",\"dependencies\":" + dependencies + ",\"neri\":{\"units\":{\"core\":{\"sources\":[\"src\"]}}}}"
+  test::assertEqual(ito::writeAtomic(path + "/package.json", manifest), 0)
+  test::assertEqual(ito::writeAtomic(path + "/src/library.hk", source), 0)
+end
+
+def rootManifest(dependencies: String): ito::Json
+  return document("{\"name\":\"app\",\"version\":\"0.1.0\",\"dependencies\":" + dependencies + "}")
+end
+
+def lockText(graph: ito::PackageGraph): String
+  if graph.error != ""
+    console::println(graph.error)
+  end
+  test::assertEqual(graph.error, "")
+  let lock = ito::graphLock(graph)
+  test::assertTrue(lock != null)
+  if lock != null
+    return ito::jsonStringify(lock)
+  end
+  return ""
+end
+
+def main(): Void
+  let argument = host::argumentAt(0)
+  let mode = host::argumentAt(1)
+  if argument == null || mode == null
+    test::assertTrue(false)
+    return
+  end
+  let base = argument + "/graph-" + mode
+  let app = base + "/app"
+  test::assertEqual(ito::fs(1, app), 0)
+  library(base + "/leaf", "leaf")
+  library(base + "/left", "left", "{\"leaf\":{\"path\":\"../leaf\"}}")
+  library(base + "/right", "right", "{\"leaf\":{\"path\":\"../leaf\"}}")
+  let root = rootManifest("{\"left\":{\"path\":\"../left\"},\"right\":{\"path\":\"../right\"}}")
+  let graph = ito::resolveGraph(root, app)
+  let text = lockText(graph)
+  test::assertEqual(graph.count, 3)
+  let lock = document(text)
+  test::assertEqual(lock.get("packages").get("leaf").get("source").get("path").value, "../leaf")
+  test::assertEqual(lock.get("packages").get("left").get("dependencies").get("leaf").value, lock.get("packages").get("leaf").get("integrity").value)
+  let reordered = rootManifest("{\"right\":{\"path\":\"../right\"},\"left\":{\"path\":\"../left\"}}")
+  test::assertEqual(text, lockText(ito::resolveGraph(reordered, app)))
+  test::assertEqual(ito::publishGraph(base + "/cache", graph), "")
+  test::assertEqual(ito::validateLock(lock, root), "")
+  let oversized = document(text)
+  var padding = "x"
+  while host::stringByteLength(padding) < 1048576
+    padding = padding + padding
+  end
+  oversized.get("root").add(ito::jsonString(padding, "metadata"))
+  test::assertEqual(ito::validateLock(oversized, root), "")
+  test::assertTrue(ito::validateLockWrite(oversized, root) != "")
+  test::assertEqual(ito::persistLock(app + "/ito.lock", graph), "")
+  let persisted = host::readText(app + "/ito.lock")
+  test::assertTrue(persisted != null)
+  if persisted != null
+    test::assertEqual(persisted, text + "\n")
+  end
+  test::assertEqual(lockText(ito::restoreGraph(base + "/cache", root, app, lock)), text)
+  test::assertEqual(lockText(ito::restoreGraph(base + "/restored-cache", root, app, lock)), text)
+  test::assertTrue(ito::validateLock(lock, rootManifest("{\"left\":{\"path\":\"../other\"}}")) != "")
+  let badVersion = document(text)
+  badVersion.get("lockVersion").value = "2"
+  test::assertTrue(ito::validateLock(badVersion, root) != "")
+  let badEdge = document(text)
+  badEdge.get("packages").get("left").get("dependencies").get("leaf").value = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  test::assertTrue(ito::validateLock(badEdge, root) != "")
+  let badPath = document(text)
+  badPath.get("packages").get("leaf").get("source").get("path").value = "/outside"
+  test::assertTrue(ito::validateLock(badPath, root) != "")
+  let unreachable = document(text)
+  let orphan = ito::canonicalJson(lock.get("packages").get("leaf"))
+  orphan.key = "orphan"
+  unreachable.get("packages").add(orphan)
+  test::assertTrue(ito::validateLock(unreachable, root) != "")
+  let lockCycle = document(text)
+  lockCycle.get("packages").get("leaf").get("dependencies").add(ito::jsonString(lock.get("packages").get("left").get("integrity").value, "left"))
+  test::assertTrue(ito::validateLock(lockCycle, root) != "")
+  let undeclared = document(text)
+  undeclared.get("packages").get("left").get("dependencies").first = null
+  undeclared.get("packages").get("left").get("dependencies").last = null
+  test::assertEqual(ito::validateLock(undeclared, root), "")
+  test::assertTrue(ito::restoreGraph(base + "/cache", root, app, undeclared).error != "")
+  test::assertEqual(ito::writeAtomic(base + "/leaf/src/library.hk", "# edited after locking\n"), 0)
+  test::assertEqual(lockText(ito::restoreGraph(base + "/cache", root, app, lock)), text)
+  test::assertTrue(ito::restoreGraph(base + "/missing-cache", root, app, lock).error != "")
+  test::assertEqual(ito::writeAtomic(base + "/leaf/src/library.hk", "# source\n"), 0)
+  let empty = ito::resolveGraph(rootManifest("{}"), app)
+  test::assertEqual(empty.error, "")
+  test::assertEqual(empty.count, 0)
+  test::assertTrue(ito::resolveGraph(rootManifest("{\"alias\":{\"path\":\"../leaf\"}}"), app).error != "")
+  test::assertTrue(ito::resolveGraph(rootManifest("{\"absent\":{\"path\":\"../absent\"}}"), app).error != "")
+  test::assertTrue(ito::resolveGraph(rootManifest("{\"app\":{\"path\":\"../app\"}}"), app).error != "")
+  library(base + "/other/leaf", "leaf", "{}", "# different instance\n")
+  library(base + "/right", "right", "{\"leaf\":{\"path\":\"../other/leaf\"}}")
+  let conflicting = ito::resolveGraph(root, app)
+  test::assertTrue(conflicting.error != "")
+  test::assertTrue(ito::graphLock(conflicting) == null)
+  test::assertTrue(ito::publishGraph(base + "/cache", conflicting) != "")
+  # Same package bytes in distinct origins still require checking each closure.
+  library(base + "/one/atom", "atom")
+  library(base + "/two/atom", "atom")
+  library(base + "/one/leaf", "leaf", "{\"atom\":{\"path\":\"../atom\"}}")
+  library(base + "/two/leaf", "leaf", "{\"atom\":{\"path\":\"../atom\"}}")
+  library(base + "/left", "left", "{\"leaf\":{\"path\":\"../one/leaf\"}}")
+  library(base + "/right", "right", "{\"leaf\":{\"path\":\"../two/leaf\"}}")
+  let shared = ito::resolveGraph(root, app)
+  test::assertEqual(shared.error, "")
+  test::assertEqual(shared.count, 4)
+  library(base + "/two/atom", "atom", "{}", "# conflicting transitive instance\n")
+  test::assertTrue(ito::resolveGraph(root, app).error != "")
+  library(base + "/left", "left", "{\"right\":{\"path\":\"../right\"}}")
+  library(base + "/right", "right", "{\"left\":{\"path\":\"../left\"}}")
+  let cycle = ito::resolveGraph(root, app)
+  test::assertTrue(cycle.error != "")
+  test::assertEqual(host::stringSlice(cycle.error, 0, 24), "package dependency cycle")
+  test::assertEqual(ito::relativePath("/a/b/app", "/a/b/lib"), "../lib")
+  test::assertEqual(ito::relativePath("/a/b", "/a/b/lib"), "lib")
+  test::assertEqual(ito::relativePath("/a/b/app", "/a"), "../..")
+  test::assertEqual(ito::jsonStringify(ito::canonicalJson(document("{\"z\":{\"y\":1,\"a\":2},\"a\":[3,2,1]}"))), "{\"a\":[3,2,1],\"z\":{\"a\":2,\"y\":1}}")
+  updateContracts(base + "/updates")
+  console::println("Ito dependency graph contracts passed")
+end
+
+def updateContracts(base: String): Void
+  let app = base + "/app"
+  let cache = base + "/cache"
+  test::assertEqual(ito::fs(1, app), 0)
+  library(base + "/leaf", "leaf")
+  library(base + "/left", "left", "{\"leaf\":{\"path\":\"../leaf\"}}")
+  library(base + "/right", "right")
+  let root = rootManifest("{\"left\":{\"path\":\"../left\"},\"right\":{\"path\":\"../right\"}}")
+  let original = ito::resolveGraph(root, app)
+  let text = lockText(original)
+  let lock = document(text)
+  test::assertEqual(ito::publishGraph(cache, original), "")
+  let oldRight = lock.get("packages").get("right").get("integrity").value
+  test::assertEqual(ito::writeAtomic(base + "/left/src/library.hk", "# updated left\n"), 0)
+  test::assertEqual(ito::writeAtomic(base + "/leaf/src/library.hk", "# updated leaf\n"), 0)
+  test::assertEqual(ito::writeAtomic(base + "/right/src/library.hk", "# unselected right edit\n"), 0)
+  let updated = ito::updateGraph(cache, root, app, lock, document("[\"left\"]"))
+  let updatedLock = document(lockText(updated))
+  test::assertEqual(updatedLock.get("packages").get("right").get("integrity").value, oldRight)
+  test::assertTrue(updatedLock.get("packages").get("left").get("integrity").value != lock.get("packages").get("left").get("integrity").value)
+  test::assertTrue(updatedLock.get("packages").get("leaf").get("integrity").value != lock.get("packages").get("leaf").get("integrity").value)
+  test::assertEqual(ito::jsonStringify(lock), text)
+  test::assertTrue(ito::updateGraph(cache, root, app, lock, document("[\"leaf\"]")).error != "")
+  test::assertTrue(ito::updateGraph(cache, root, app, lock, document("[\"absent\"]")).error != "")
+  library(base + "/extra", "extra")
+  let added = ito::objectWith(root, "dependencies", ito::objectWith(root.get("dependencies"), "extra", document("{\"path\":\"../extra\"}")))
+  test::assertTrue(ito::updateGraph(cache, added, app, lock, document("[]")).error != "")
+  let addedGraph = ito::updateGraph(cache, added, app, lock, document("[\"extra\"]"))
+  let addedLock = document(lockText(addedGraph))
+  test::assertEqual(addedGraph.count, 4)
+  test::assertEqual(addedLock.get("packages").get("right").get("integrity").value, oldRight)
+  test::assertEqual(addedLock.get("packages").get("left").get("integrity").value, lock.get("packages").get("left").get("integrity").value)
+  let removed = ito::objectWith(root, "dependencies", ito::objectWithout(root.get("dependencies"), "left"))
+  let removedGraph = ito::updateGraph(cache, removed, app, lock, document("[]"))
+  test::assertEqual(removedGraph.error, "")
+  test::assertEqual(removedGraph.count, 1)
+  test::assertTrue(removedGraph.get("left") == null)
+  test::assertTrue(removedGraph.get("leaf") == null)
+  let removedLock = document(lockText(removedGraph))
+  test::assertEqual(removedLock.get("packages").get("right").get("integrity").value, oldRight)
+  # A preserved origin may disappear after the first installation.
+  test::assertTrue(ito::removeStage(base + "/right"))
+  test::assertEqual(ito::updateGraph(cache, root, app, lock, document("[\"left\"]")).error, "")
+  # Updating one root cannot silently move a transitive dependency pinned by another.
+  library(base + "/left", "left", "{\"leaf\":{\"path\":\"../leaf\"}}")
+  library(base + "/right", "right", "{\"leaf\":{\"path\":\"../leaf\"}}")
+  library(base + "/leaf", "leaf")
+  let shared = ito::resolveGraph(root, app)
+  let sharedLock = document(lockText(shared))
+  test::assertEqual(ito::publishGraph(cache, shared), "")
+  test::assertEqual(ito::writeAtomic(base + "/leaf/src/library.hk", "# changed shared dependency\n"), 0)
+  let conflict = ito::updateGraph(cache, root, app, sharedLock, document("[\"left\"]"))
+  test::assertTrue(conflict.error != "")
+  test::assertTrue(ito::graphLock(conflict) == null)
+  let together = ito::updateGraph(cache, root, app, sharedLock, document("[\"left\",\"right\"]"))
+  test::assertEqual(together.error, "")
+  test::assertEqual(together.count, 3)
+  test::assertTrue(lockText(together) != ito::jsonStringify(sharedLock))
+  console::println("Ito selective update contracts passed")
+end

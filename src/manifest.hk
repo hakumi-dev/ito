@@ -1,0 +1,281 @@
+use host
+namespace ito
+
+# All values that become filesystem components are validated before use.
+def packageName(value: String): Bool
+  let length = host::stringByteLength(value)
+  if length < 1 || length > 64
+    return false
+  end
+  var index = 0
+  while index < length
+    let byte = host::stringByteAt(value, index) as Int
+    if !(byte >= 97 && byte <= 122) && !(index > 0 && ((byte >= 48 && byte <= 57) || byte == 45))
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def packageVersion(value: String): Bool
+  let length = host::stringByteLength(value)
+  if length < 5 || length > 80
+    return false
+  end
+  var index = 0
+  var component = 0
+  while component < 3
+    let start = index
+    while index < length && (host::stringByteAt(value, index) as Int) >= 48 && (host::stringByteAt(value, index) as Int) <= 57
+      index = index + 1
+    end
+    if index == start || (index - start > 1 && host::stringByteAt(value, start) == 48 as Byte)
+      return false
+    end
+    component = component + 1
+    if component < 3
+      if index >= length || host::stringByteAt(value, index) != 46 as Byte
+        return false
+      end
+      index = index + 1
+    end
+  end
+  if index == length
+    return true
+  end
+  if host::stringByteAt(value, index) != 45 as Byte
+    return false
+  end
+  index = index + 1
+  var segment = 0
+  while index < length
+    let byte = host::stringByteAt(value, index) as Int
+    if byte == 46
+      if segment == 0
+        return false
+      end
+      segment = 0
+    else
+      if !((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 45)
+        return false
+      end
+      segment = segment + 1
+    end
+    index = index + 1
+  end
+  return segment > 0
+end
+
+# Dependency origins may ascend; payload paths must stay beneath their root.
+def localPath(value: String, allowParent: Bool = false): Bool
+  let length = host::stringByteLength(value)
+  if length == 0 || length > 4096 || host::stringByteAt(value, 0) == 47 as Byte
+    return false
+  end
+  var start = 0
+  var index = 0
+  while index <= length
+    if index == length || host::stringByteAt(value, index) == 47 as Byte
+      let part = host::stringSlice(value, start, index - start)
+      if part == "" || part == "." || (!allowParent && part == "..")
+        return false
+      end
+      start = index + 1
+    else
+      let byte = host::stringByteAt(value, index) as Int
+      if byte < 32 || byte == 127 || byte == 92 || byte == 58
+        return false
+      end
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def stringMember(array: Json, value: String): Bool
+  var item = array.first
+  while item != null
+    if item.kind == "string" && item.value == value
+      return true
+    end
+    item = item.next
+  end
+  return false
+end
+
+def validateStrings(node: Json, paths: Bool, required: Bool = false): String
+  if node.kind == "missing" && !required
+    return ""
+  end
+  if node.kind != "array" || (required && node.first == null)
+    return "expected a nonempty array of strings"
+  end
+  var count = 0
+  var item = node.first
+  while item != null
+    if item.kind != "string"
+      return "array entries must be strings"
+    end
+    if paths && !localPath(item.value)
+      return "source paths must be normalized and package-local: " + item.value
+    end
+    if !paths && !packageName(item.value)
+      return "invalid unit name: " + item.value
+    end
+    var later = item.next
+    while later != null
+      if later.value == item.value
+        return "duplicate array entry: " + item.value
+      end
+      later = later.next
+    end
+    count = count + 1
+    if count > 128
+      return "at most 128 entries are supported"
+    end
+    item = item.next
+  end
+  return ""
+end
+
+def unitCycle(units: Json, name: String, trail: String, depth: Int, done: Json): String
+  if stringMember(done, name)
+    return ""
+  end
+  if depth > 128
+    return "unit dependency depth exceeds 128"
+  end
+  # Names cannot contain '/', making the delimiter unambiguous.
+  let marker = "/" + name + "/"
+  var index = 0
+  while index + host::stringByteLength(marker) <= host::stringByteLength(trail)
+    if host::stringSlice(trail, index, host::stringByteLength(marker)) == marker
+      return "unit dependency cycle: " + trail + name
+    end
+    index = index + 1
+  end
+  var reference = units.get(name).get("references").first
+  while reference != null
+    let error = unitCycle(units, reference.value, trail + name + "/", depth + 1, done)
+    if error != ""
+      return error
+    end
+    reference = reference.next
+  end
+  done.add(jsonString(name))
+  return ""
+end
+
+def validateManifest(document: Json, library: Bool = false): String
+  if document.kind != "object"
+    return "package.json must contain an object"
+  end
+  if document.get("name").kind != "string" || !packageName(document.get("name").value)
+    return "invalid package name; use lowercase letters, digits and hyphens"
+  end
+  if document.get("version").kind != "string" || !packageVersion(document.get("version").value)
+    return "invalid version; use major.minor.patch with an optional prerelease suffix"
+  end
+  let dependencies = document.get("dependencies")
+  if dependencies.kind != "missing" && dependencies.kind != "object"
+    return "dependencies must be an object"
+  end
+  var dependency = dependencies.first
+  var count = 0
+  while dependency != null
+    if !packageName(dependency.key) || dependency.kind != "object"
+      return "invalid dependency: " + dependency.key
+    end
+    let path = dependency.get("path")
+    if path.kind != "string" || !localPath(path.value, true)
+      return "dependency requires a relative local path: " + dependency.key
+    end
+    var field = dependency.first
+    while field != null
+      if field.key != "path"
+        return "unsupported dependency field: " + field.key
+      end
+      field = field.next
+    end
+    count = count + 1
+    if count > 256
+      return "at most 256 dependencies are supported"
+    end
+    dependency = dependency.next
+  end
+  let neri = document.get("neri")
+  if neri.kind != "missing" && neri.kind != "object"
+    return "neri must be an object"
+  end
+  let units = neri.get("units")
+  if library && (units.kind != "object" || units.first == null)
+    return "library packages require nonempty neri.units"
+  end
+  if units.kind != "missing" && units.kind != "object"
+    return "neri.units must be an object"
+  end
+  count = 0
+  var unit = units.first
+  while unit != null
+    if !packageName(unit.key) || unit.kind != "object" || (unit.get("kind").kind != "missing" && (unit.get("kind").value != "library" || unit.get("kind").kind != "string"))
+      return "invalid library unit: " + unit.key
+    end
+    let sourcesError = validateStrings(unit.get("sources"), true, true)
+    if sourcesError != ""
+      return unit.key + ".sources: " + sourcesError
+    end
+    let exclusionError = validateStrings(unit.get("exclude"), true)
+    if exclusionError != ""
+      return unit.key + ".exclude: " + exclusionError
+    end
+    let referenceError = validateStrings(unit.get("references"), false)
+    if referenceError != ""
+      return unit.key + ".references: " + referenceError
+    end
+    var reference = unit.get("references").first
+    while reference != null
+      if units.get(reference.value).kind == "missing"
+        return "unknown local unit reference: " + reference.value
+      end
+      reference = reference.next
+    end
+    count = count + 1
+    if count > 128
+      return "at most 128 units are supported"
+    end
+    unit = unit.next
+  end
+  let done = jsonArray()
+  unit = units.first
+  while unit != null
+    let cycle = unitCycle(units, unit.key, "/", 0, done)
+    if cycle != ""
+      return cycle
+    end
+    unit = unit.next
+  end
+  let exports = neri.get("exports")
+  let exportError = validateStrings(exports, false)
+  if exportError != ""
+    return "neri.exports: " + exportError
+  end
+  var exported = exports.first
+  while exported != null
+    if units.get(exported.value).kind == "missing"
+      return "unknown exported unit: " + exported.value
+    end
+    exported = exported.next
+  end
+  let entry = neri.get("entry")
+  if entry.kind != "missing" && (entry.kind != "string" || !localPath(entry.value))
+    return "neri.entry must be a normalized package-local path"
+  end
+  for field in ["sources", "tests"]
+    let error = validateStrings(neri.get(field), true)
+    if error != ""
+      return "neri." + field + ": " + error
+    end
+  end
+  return ""
+end

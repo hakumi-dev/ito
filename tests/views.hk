@@ -1,0 +1,160 @@
+use ito
+use host
+use test
+use console
+
+def parse(text: String): ito::Json
+  let value = ito::parseJson(text)
+  test::assertTrue(value != null)
+  if value != null
+    return value
+  end
+  return ito::jsonObject()
+end
+
+def library(path: String, name: String, dependencies: String, code: String): Void
+  test::assertEqual(ito::fs(1, path + "/src"), 0)
+  test::assertEqual(ito::writeAtomic(path + "/package.json", "{\"name\":" + ito::jsonQuote(name) + ",\"version\":\"0.1.0\",\"dependencies\":" + dependencies + ",\"neri\":{\"units\":{\"core\":{\"sources\":[\"src\"]}}}}"), 0)
+  test::assertEqual(ito::writeAtomic(path + "/src/library.hk", code), 0)
+end
+
+def checkView(view: ito::CompilationView): Void
+  if view.error != ""
+    console::println(view.error)
+  end
+  test::assertEqual(view.error, "")
+end
+
+def run(program: String, args: String[]): Void
+  let status = host::run(program, args)
+  test::assertTrue(status != null)
+  if status != null
+    test::assertEqual(status, 0)
+  end
+end
+
+def main(): Void
+  let root = host::argumentAt(0)
+  let mode = host::argumentAt(1)
+  if root == null || mode == null
+    test::assertTrue(false)
+    return
+  end
+  let base = root + "/views-" + mode
+  let app = base + "/my app"
+  let home = base + "/cache"
+  library(base + "/leaf", "leaf", "{}", "namespace leaf\n\ndef value(): Int\n  return 7\nend\n")
+  library(base + "/middle", "middle", "{\"leaf\":{\"path\":\"../leaf\"}}", "use leaf\nnamespace middle\n\ndef value(): Int\n  return leaf::value() + 5\nend\n")
+  test::assertEqual(ito::fs(1, app + "/app"), 0)
+  test::assertEqual(ito::fs(1, app + "/tests"), 0)
+  test::assertEqual(ito::fs(1, app + "/build"), 0)
+  let manifestText = "{\"name\":\"demo\",\"version\":\"0.1.0\",\"dependencies\":{\"middle\":{\"path\":\"../middle\"}}}"
+  let manifest = parse(manifestText)
+  let appCode = "use middle\nnamespace application\n\ndef value(): Int\n  return middle::value()\nend\n"
+  test::assertEqual(ito::writeAtomic(app + "/package.json", manifestText), 0)
+  test::assertEqual(ito::writeAtomic(app + "/app/routes.hk", appCode), 0)
+  test::assertEqual(ito::writeAtomic(app + "/main.hk", "use application\nuse test\nuse console\n\ndef main(): Void\n  test::assertEqual(application::value(), 12)\n  console::println(\"Generated application passed\")\nend\n"), 0)
+  test::assertEqual(ito::writeAtomic(app + "/tests/contracts.hk", "use application\nuse test\n\ndef main(): Void\n  test::assertEqual(application::value(), 12)\nend\n"), 0)
+  let graph = ito::resolveGraph(manifest, app)
+  test::assertEqual(graph.error, "")
+  test::assertTrue(ito::prepareGraphView(home, graph).error != "")
+  test::assertEqual(ito::publishGraph(home, graph), "")
+  let first = ito::prepareApplicationView(home, graph)
+  checkView(first)
+  let second = ito::prepareApplicationView(home, graph)
+  checkView(second)
+  test::assertEqual(first.path, second.path)
+  let shared = ito::prepareGraphView(home, graph)
+  checkView(shared)
+  let generated = ito::readDocument(app + "/.neri/ito", "manifest.json").document
+  test::assertTrue(generated != null)
+  var oldSource = ""
+  let leaf = graph.get("leaf")
+  if leaf != null && generated != null
+    let cached = ito::cacheRead(home, "leaf", "0.1.0", leaf.snapshot.integrity)
+    let ownSource = generated.get("units").get("app").get("sources").first
+    test::assertTrue(ownSource != null)
+    if ownSource != null
+      oldSource = ownSource.value
+      let sourcePrefix = ito::relativePath(app + "/.neri/ito", app + "/.neri/ito/snapshots/" + host::stringSlice(ito::collectApplication(app, manifest).snapshot.integrity, 7, 64))
+      test::assertEqual(generated.get("sourceMap").get(sourcePrefix).value, "../..")
+      let paths = cached.path + "/src/library.hk\n" + shared.path + "/packages/leaf/src/library.hk\n" + app + "/app/routes.hk\n" + app + "/.neri/ito/" + ownSource.value + "\n"
+      test::assertEqual(ito::writeAtomic(base + "/hardlinks.txt", paths), 0)
+    end
+  end
+  let relocated = new ito::PackageGraph(manifest, base + "/elsewhere")
+  ito::mergeGraph(relocated, graph)
+  test::assertTrue(ito::graphViewIdentity(relocated) == ito::graphViewIdentity(graph))
+  let capturedCode = appCode + "# captured before another editor write\n"
+  test::assertTrue(host::writeText(app + "/app/routes.hk", capturedCode))
+  let captured = ito::collectApplication(app, manifest).snapshot
+  test::assertEqual(captured.error, "")
+  test::assertTrue(host::writeText(app + "/app/routes.hk", appCode + "# later editor write\n"))
+  let capturedView = ito::prepareSourceView(app, captured)
+  checkView(capturedView)
+  let capturedText = host::readText(capturedView.path + "/app/routes.hk")
+  test::assertTrue(capturedText != null)
+  if capturedText != null
+    test::assertEqual(capturedText, capturedCode)
+  end
+  test::assertEqual(ito::writeAtomic(app + "/app/routes.hk", appCode), 0)
+  # An editor's in-place write must not mutate the captured source view.
+  test::assertTrue(host::writeText(app + "/app/routes.hk", appCode + "# in-place edit\n"))
+  let edited = ito::prepareApplicationView(home, graph)
+  checkView(edited)
+  test::assertEqual(edited.path, first.path)
+  if oldSource != ""
+    let oldText = host::readText(app + "/.neri/ito/" + oldSource)
+    test::assertTrue(oldText != null)
+    if oldText != null
+      test::assertEqual(oldText, appCode)
+    end
+  end
+  let editedManifest = ito::readDocument(app + "/.neri/ito", "manifest.json").document
+  test::assertTrue(editedManifest != null)
+  if editedManifest != null
+    let editedSource = editedManifest.get("units").get("app").get("sources").first
+    test::assertTrue(editedSource != null)
+    if editedSource != null
+      test::assertTrue(editedSource.value != oldSource)
+    end
+    let mapped = editedManifest.get("sourceMap").first
+    test::assertTrue(mapped != null)
+    if mapped != null
+      test::assertEqual(mapped.value, "../..")
+    end
+  end
+  test::assertEqual(ito::writeAtomic(app + "/app/routes.hk", appCode), 0)
+  let refreshed = ito::prepareApplicationView(home, graph)
+  checkView(refreshed)
+  let restored = ito::readDocument(app + "/.neri/ito", "manifest.json").document
+  test::assertTrue(restored != null)
+  if restored != null && generated != null
+    test::assertEqual(ito::jsonStringify(ito::canonicalJson(restored)), ito::jsonStringify(ito::canonicalJson(generated)))
+  end
+  var compiler = "neri"
+  let configured = host::environment("NERI")
+  if configured != null
+    compiler = configured
+  end
+  var flags: String[] = ["build", "--project", refreshed.path, "--unit", "web", "--output", app + "/build/application"]
+  if mode == "release"
+    flags = host::appendString(flags, "--release")
+  end
+  run(compiler, flags)
+  run(app + "/build/application", [])
+  var testFlags: String[] = ["build", "--project", refreshed.path, "--unit", "test", "--output", app + "/build/tests"]
+  if mode == "release"
+    testFlags = host::appendString(testFlags, "--release")
+  end
+  run(compiler, testFlags)
+  run(app + "/build/tests", [])
+  test::assertEqual(ito::writeAtomic(shared.path + "/packages/middle/manifest.json", "{}"), 0)
+  test::assertTrue(ito::prepareApplicationView(home, graph).error != "")
+  if oldSource != ""
+    test::assertEqual(ito::writeAtomic(app + "/.neri/ito/" + oldSource, "# corrupted snapshot\n"), 0)
+    let corrupted = ito::prepareSourceView(app, ito::collectApplication(app, manifest).snapshot)
+    test::assertEqual(corrupted.error, "generated application sources do not match the current snapshot")
+  end
+  console::println("Ito generated compilation view contracts passed")
+end

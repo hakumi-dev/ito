@@ -1,0 +1,128 @@
+use host
+use tasks
+use buffers
+use files
+namespace ito
+
+@library("ito-os")
+@cabiImport("ito_canonical")
+unsafe def nativeCanonical(path: Byte*, length: Int, output: Byte*, capacity: Int): Int
+end
+
+def physicalPath(path: String, allowMissing: Bool = false, depth: Int = 0): String?
+  if depth > 100
+    return null
+  end
+  let absolute = host::pathAbsolute(path)
+  if absolute == null
+    return null
+  end
+  let input = pathBytes(absolute)
+  if input == null
+    return null
+  end
+  let output: Byte[] = tasks::generate(4096, 1) do |index|
+    return 0 as Byte
+  end
+  var count = -1
+  unsafe
+    borrow input as pointer
+      borrow output as resolved
+        count = nativeCanonical(pointer, input.Length, resolved, output.Length)
+      end
+    end
+  end
+  if count >= 0
+    let buffer = buffers::ByteBuffer.create(4096)
+    if buffer != null && buffer.appendSlice(output, 0, count)
+      return buffer.text()
+    end
+    return null
+  end
+  if !allowMissing || count != -2 || absolute == "/"
+    return null
+  end
+  let parent = directoryName(absolute)
+  let physicalParent = physicalPath(parent == "" ? "/" : parent, true, depth + 1)
+  if physicalParent == null
+    return null
+  end
+  let leaf = host::stringSlice(absolute, host::stringByteLength(parent) + 1, host::stringByteLength(absolute) - host::stringByteLength(parent) - 1)
+  if physicalParent == "/"
+    return "/" + leaf
+  end
+  return physicalParent + "/" + leaf
+end
+
+class DocumentRead
+  public document: Json?
+  public missing: Bool = false
+  public error: String = ""
+end
+
+def readDocument(project: String, path: String): DocumentRead
+  let result = new DocumentRead()
+  let opened = files::Root.open(project)
+  let root = opened.root
+  if root == null
+    result.error = "cannot open project directory: " + project
+    return result
+  end
+  let read = root.readBytes(path, 1048576)
+  let closed = root.close()
+  let failure = read.failure
+  if read.closeFailure != null || closed != null
+    result.error = "cannot close project file: " + path
+    return result
+  end
+  if failure != null
+    if failure.osCode == 2
+      result.missing = true
+    else
+      result.error = "cannot read project file: " + path
+    end
+    return result
+  end
+  let bytes = read.bytes
+  if bytes == null
+    result.error = "cannot read project file: " + path
+    return result
+  end
+  let text = host::stringFromBytes(bytes)
+  if text != null
+    result.document = parseJson(text)
+  end
+  if result.document == null
+    result.error = "invalid JSON in " + path
+  end
+  return result
+end
+
+def jsonPretty(node: Json, depth: Int = 0): String
+  if (node.kind != "object" && node.kind != "array") || node.first == null
+    return jsonStringify(node)
+  end
+  var indent = ""
+  var level = 0
+  while level < depth
+    indent = indent + "  "
+    level = level + 1
+  end
+  let result = new JsonText()
+  result.add(node.kind == "object" ? "{\n" : "[\n")
+  var child = node.first
+  while child != null
+    result.add(indent + "  ")
+    if node.kind == "object"
+      result.add(jsonQuote(child.key) + ": ")
+    end
+    result.add(jsonPretty(child, depth + 1))
+    if child.next != null
+      result.add(",")
+    end
+    result.add("\n")
+    child = child.next
+  end
+  result.add(indent + (node.kind == "object" ? "}" : "]"))
+  return result.text()
+end

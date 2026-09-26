@@ -1,0 +1,289 @@
+use host
+use files
+use crypto
+use buffers
+namespace ito
+
+class CompilationView
+  public path: String = ""
+  public error: String = ""
+end
+
+def jsonNumber(value: String, key: String): Json
+  let result = new Json()
+  result.kind = "number"
+  result.value = value
+  result.key = key
+  return result
+end
+
+def unitFiles(snapshot: Snapshot, sources: Json, excluded: Json): Json
+  let result = jsonArray()
+  var file = snapshot.first
+  while file != null
+    if file.path != "package.json" && !pathExcluded(file.path, excluded)
+      var source = sources.first
+      var selected = false
+      while source != null
+        if pathWithin(file.path, source.value)
+          selected = true
+        end
+        source = source.next
+      end
+      if selected
+        result.add(jsonString(file.path))
+      end
+    end
+    file = file.next
+  end
+  return result
+end
+
+def exportedUnits(node: PackageNode): Json
+  let manifest = node.snapshot.manifest
+  if manifest == null
+    return jsonArray()
+  end
+  let exports = manifest.get("neri").get("exports")
+  if exports.kind == "missing"
+    return fieldNames(manifest.get("neri").get("units"))
+  end
+  return canonicalJson(exports)
+end
+
+def packageReferences(graph: PackageGraph, dependencies: Json, from: String, packagesPath: String): Json
+  let result = jsonArray()
+  var dependency = dependencies.first
+  while dependency != null
+    let node = graph.get(dependency.key)
+    if node != null
+      let exports = exportedUnits(node)
+      var exported = exports.first
+      while exported != null
+        let reference = jsonObject()
+        reference.add(jsonString(relativePath(from, packagesPath + "/" + node.name + "/manifest.json"), "project"))
+        reference.add(jsonString(exported.value, "unit"))
+        result.add(reference)
+        exported = exported.next
+      end
+    end
+    dependency = dependency.next
+  end
+  return result
+end
+
+def packageViewManifest(graph: PackageGraph, node: PackageNode): Json?
+  let source = node.snapshot.manifest
+  if source == null
+    return null
+  end
+  let manifest = jsonObject()
+  manifest.add(jsonNumber("2", "version"))
+  let units = jsonObject()
+  units.key = "units"
+  let declarations = canonicalJson(source.get("neri").get("units"))
+  var declaration = declarations.first
+  var first = true
+  while declaration != null
+    if first
+      manifest.add(jsonString(declaration.key, "defaultUnit"))
+      first = false
+    end
+    let unit = jsonObject()
+    unit.key = declaration.key
+    unit.add(jsonString("library", "kind"))
+    let sources = unitFiles(node.snapshot, declaration.get("sources"), declaration.get("exclude"))
+    if sources.first == null
+      return null
+    end
+    sources.key = "sources"
+    unit.add(sources)
+    let references = packageReferences(graph, node.dependencies, "/packages/" + node.name, "/packages")
+    references.key = "references"
+    var local = declaration.get("references").first
+    while local != null
+      references.add(jsonString(local.value))
+      local = local.next
+    end
+    unit.add(references)
+    units.add(unit)
+    declaration = declaration.next
+  end
+  manifest.add(units)
+  return canonicalJson(manifest)
+end
+
+def graphViewIdentity(graph: PackageGraph): String?
+  let lock = graphLock(graph)
+  if lock == null
+    return null
+  end
+  let identities = jsonObject()
+  var package = lock.get("packages").first
+  while package != null
+    let identity = objectWithout(package, "source")
+    identity.key = package.key
+    identities.add(identity)
+    package = package.next
+  end
+  let buffer = buffers::ByteBuffer.create(4194304)
+  if buffer == null || !buffer.appendText("ito-compilation-graph-v1") || !buffer.append(0 as Byte) || !buffer.appendText(jsonStringify(canonicalJson(identities)))
+    return null
+  end
+  let digest = crypto::sha256(buffer.snapshot()).bytes()
+  if digest == null
+    return null
+  end
+  return crypto::encodeHex(digest)
+end
+
+def linkSnapshot(source: String, target: String, snapshot: Snapshot): String
+  if fs(1, target) != 0
+    return "cannot create compilation view directory"
+  end
+  var directory = snapshot.directories.first
+  while directory != null
+    if fs(1, target + "/" + directory.value) != 0
+      return "cannot create source directory in compilation view"
+    end
+    directory = directory.next
+  end
+  var file = snapshot.first
+  while file != null
+    let destination = target + "/" + file.path
+    if fs(1, directoryName(destination)) != 0 || fs(5, source + "/" + file.path, destination) != 0
+      return "cannot hardlink source into compilation view (same filesystem required): " + file.path
+    end
+    file = file.next
+  end
+  return ""
+end
+
+def verifyGraphView(path: String, graph: PackageGraph): String
+  let opened = files::Root.open(path).root
+  if opened == null
+    return "cannot open compilation graph view: " + path
+  end
+  if opened.close() != null
+    return "cannot close compilation graph view: " + path
+  end
+  var node = graph.first
+  while node != null
+    let packagePath = path + "/packages/" + node.name
+    let snapshot = readSnapshot(packagePath)
+    if snapshot.error != "" || snapshot.integrity != node.snapshot.integrity
+      return "compilation view source integrity failed: " + packagePath
+    end
+    let expected = packageViewManifest(graph, node)
+    let read = readDocument(packagePath, "manifest.json")
+    let actual = read.document
+    if expected == null || actual == null || read.error != "" || jsonStringify(canonicalJson(actual)) != jsonStringify(expected)
+      return "compilation view manifest integrity failed: " + packagePath
+    end
+    node = node.next
+  end
+  return ""
+end
+
+def prepareGraphView(home: String, graph: PackageGraph): CompilationView
+  let result = new CompilationView()
+  if graph.error != ""
+    result.error = graph.error
+    return result
+  end
+  # Recheck source-cache integrity even when the compilation view already exists.
+  var node = graph.first
+  while node != null
+    let manifest = node.snapshot.manifest
+    if manifest == null
+      result.error = "missing package manifest"
+      return result
+    end
+    let stored = cacheRead(home, node.name, manifest.get("version").value, node.snapshot.integrity)
+    if stored.error != "" || stored.missing
+      result.error = "package cache is unavailable or invalid before compilation: " + node.name
+      return result
+    end
+    if packageViewManifest(graph, node) == null
+      result.error = "library unit has no selected sources: " + node.name
+      return result
+    end
+    node = node.next
+  end
+  let identity = graphViewIdentity(graph)
+  if identity == null
+    result.error = "cannot identify compilation graph"
+    return result
+  end
+  let parent = home + "/graphs"
+  result.path = parent + "/" + identity
+  let opened = files::Root.open(result.path)
+  let existing = opened.root
+  if existing != null
+    if existing.close() != null
+      result.error = "cannot close compilation graph directory"
+      return result
+    end
+    result.error = verifyGraphView(result.path, graph)
+    return result
+  end
+  let failure = opened.failure
+  if failure == null || failure.osCode != 2
+    result.error = "cannot inspect compilation graph directory"
+    return result
+  end
+  if fs(1, parent) != 0
+    result.error = "cannot create shared compilation graph storage"
+    return result
+  end
+  let random = crypto::randomBytes(16).bytes()
+  if random == null
+    result.error = "cannot create compilation staging identity"
+    return result
+  end
+  let name = crypto::encodeHex(random)
+  if name == null
+    result.error = "cannot encode compilation staging identity"
+    return result
+  end
+  let stage = parent + "/.stage-" + name
+  if fs(9, stage) != 0
+    result.error = "cannot acquire compilation staging directory"
+    return result
+  end
+  node = graph.first
+  while node != null && result.error == ""
+    let source = node.snapshot.manifest
+    if source == null
+      result.error = "missing source manifest"
+      break
+    end
+    let cached = cacheRead(home, node.name, source.get("version").value, node.snapshot.integrity)
+    if cached.error != "" || cached.missing
+      result.error = "source cache changed while preparing compilation"
+      break
+    end
+    let target = stage + "/packages/" + node.name
+    result.error = linkSnapshot(cached.path, target, node.snapshot)
+    let manifest = packageViewManifest(graph, node)
+    if result.error == "" && manifest != null && writeAtomic(target + "/manifest.json", jsonPretty(manifest) + "\n") != 0
+      result.error = "cannot write generated package manifest"
+    end
+    node = node.next
+  end
+  if result.error == ""
+    result.error = verifyGraphView(stage, graph)
+  end
+  if result.error != ""
+    if !removeStage(stage)
+      result.error = result.error + "; staging cleanup failed: " + stage
+    end
+    return result
+  end
+  let published = fs(4, stage, result.path)
+  result.error = verifyGraphView(result.path, graph)
+  if published != 0 && !removeStage(stage)
+    result.error = "compilation staging cleanup failed: " + stage
+  end
+  return result
+end

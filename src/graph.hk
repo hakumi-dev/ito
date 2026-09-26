@@ -1,0 +1,299 @@
+use host
+namespace ito
+
+# Canonical objects are copies; sorting must not mutate a parsed manifest tree.
+def canonicalJson(node: Json): Json
+  let result = new Json()
+  result.kind = node.kind
+  result.key = node.key
+  result.value = node.value
+  var child = node.first
+  while child != null
+    let copy = canonicalJson(child)
+    if node.kind != "object"
+      result.add(copy)
+    else
+      let first = result.first
+      if first == null || textBefore(copy.key, first.key)
+        copy.next = first
+        result.first = copy
+        if first == null
+          result.last = copy
+        end
+      else
+        var previous = first
+        var next = previous.next
+        while next != null && !textBefore(copy.key, next.key)
+          previous = next
+          next = previous.next
+        end
+        copy.next = next
+        previous.next = copy
+        if next == null
+          result.last = copy
+        end
+      end
+    end
+    child = child.next
+  end
+  return result
+end
+
+def pathParts(path: String): String[]
+  var parts: String[] = []
+  var start = 0
+  var index = 0
+  while index <= host::stringByteLength(path)
+    if index == host::stringByteLength(path) || host::stringByteAt(path, index) == 47 as Byte
+      if index > start
+        parts = host::appendString(parts, host::stringSlice(path, start, index - start))
+      end
+      start = index + 1
+    end
+    index = index + 1
+  end
+  return parts
+end
+
+# Inputs are normalized absolute paths; the result is relative to the root app.
+def relativePath(base: String, target: String): String
+  let a = pathParts(base)
+  let b = pathParts(target)
+  var common = 0
+  while common < a.Length && common < b.Length && a[common] == b[common]
+    common = common + 1
+  end
+  var result = ""
+  var index = common
+  while index < a.Length
+    result = result + "../"
+    index = index + 1
+  end
+  index = common
+  while index < b.Length
+    result = result + b[index] + "/"
+    index = index + 1
+  end
+  if result == ""
+    return "."
+  end
+  return host::stringSlice(result, 0, host::stringByteLength(result) - 1)
+end
+
+def trailContains(trail: String, name: String): Bool
+  let marker = "/" + name + "/"
+  var index = 0
+  while index + host::stringByteLength(marker) <= host::stringByteLength(trail)
+    if host::stringSlice(trail, index, host::stringByteLength(marker)) == marker
+      return true
+    end
+    index = index + 1
+  end
+  return false
+end
+
+class PackageNode
+  public name: String
+  public origin: String
+  public snapshot: Snapshot
+  public dependencies: Json = jsonObject()
+  public origins: Json = jsonArray()
+  public next: PackageNode?
+
+  def init(name: String, origin: String, snapshot: Snapshot): Void
+    this.name = name
+    this.origin = origin
+    this.snapshot = snapshot
+  end
+end
+
+class PackageGraph
+  public root: Json
+  public rootPath: String
+  public first: PackageNode?
+  public error: String = ""
+  public count: Int = 0
+  public visits: Int = 0
+
+  def init(root: Json, rootPath: String): Void
+    this.root = root
+    this.rootPath = rootPath
+  end
+
+  def get(name: String): PackageNode?
+    var node = this.first
+    while node != null
+      if node.name == name
+        return node
+      end
+      node = node.next
+    end
+    return null
+  end
+
+  def insert(node: PackageNode): Void
+    let first = this.first
+    if first == null || textBefore(node.name, first.name)
+      node.next = first
+      this.first = node
+    else
+      var previous = first
+      var next = previous.next
+      while next != null && !textBefore(node.name, next.name)
+        previous = next
+        next = previous.next
+      end
+      node.next = next
+      previous.next = node
+    end
+    this.count = this.count + 1
+  end
+
+  def resolve(name: String, origin: String, trail: String, depth: Int): PackageNode?
+    if this.error != ""
+      return null
+    end
+    this.visits = this.visits + 1
+    if depth > 100 || this.visits > 4096
+      this.error = "package resolution exceeds depth or traversal limits"
+      return null
+    end
+    if trailContains(trail, name)
+      this.error = "package dependency cycle: " + trail + name
+      return null
+    end
+    let known = this.get(name)
+    if known != null && stringMember(known.origins, origin)
+      return known
+    end
+    if known == null && this.count >= 256
+      this.error = "at most 256 packages are supported"
+      return null
+    end
+    let snapshot = readSnapshot(origin)
+    let manifest = snapshot.manifest
+    if snapshot.error != "" || manifest == null
+      this.error = "cannot resolve " + name + ": " + snapshot.error
+      return null
+    end
+    if manifest.get("name").value != name
+      this.error = "dependency name does not match package.json: " + name + " at " + origin
+      return null
+    end
+    if known != null && known.snapshot.integrity != snapshot.integrity
+      this.error = "conflicting source instances for " + name + ": " + known.origin + " and " + origin
+      return null
+    end
+    let candidate = new PackageNode(name, origin, snapshot)
+    if known == null
+      this.insert(candidate)
+    end
+    let declarations = canonicalJson(manifest.get("dependencies"))
+    var declaration = declarations.first
+    while declaration != null
+      let path = host::pathAbsolute(origin + "/" + declaration.get("path").value)
+      if path == null
+        this.error = "cannot normalize dependency origin: " + declaration.key
+        return null
+      end
+      let child = this.resolve(declaration.key, path, trail + name + "/", depth + 1)
+      if child == null
+        return null
+      end
+      candidate.dependencies.add(jsonString(child.snapshot.integrity, child.name))
+      declaration = declaration.next
+    end
+    candidate.origins.add(jsonString(origin))
+    if known != null
+      if jsonStringify(known.dependencies) != jsonStringify(candidate.dependencies)
+        this.error = "conflicting dependency closures for " + name
+        return null
+      end
+      known.origins.add(jsonString(origin))
+      return known
+    end
+    return candidate
+  end
+end
+
+def resolveGraph(root: Json, rootPath: String): PackageGraph
+  let graph = new PackageGraph(root, rootPath)
+  graph.error = validateManifest(root)
+  if graph.error != ""
+    return graph
+  end
+  let declarations = canonicalJson(root.get("dependencies"))
+  var declaration = declarations.first
+  while declaration != null && graph.error == ""
+    let path = host::pathAbsolute(rootPath + "/" + declaration.get("path").value)
+    if path == null
+      graph.error = "cannot normalize dependency origin: " + declaration.key
+      return graph
+    end
+    graph.resolve(declaration.key, path, "/" + root.get("name").value + "/", 0)
+    declaration = declaration.next
+  end
+  return graph
+end
+
+def graphLock(graph: PackageGraph): Json?
+  if graph.error != ""
+    return null
+  end
+  let lock = jsonObject()
+  let format = new Json()
+  format.kind = "number"
+  format.key = "lockVersion"
+  format.value = "1"
+  lock.add(format)
+  let root = jsonObject()
+  root.key = "root"
+  root.add(jsonString(graph.root.get("name").value, "name"))
+  let declarations = canonicalJson(graph.root.get("dependencies"))
+  declarations.key = "dependencies"
+  if declarations.kind == "missing"
+    declarations.kind = "object"
+  end
+  root.add(declarations)
+  lock.add(root)
+  let packages = jsonObject()
+  packages.key = "packages"
+  var node = graph.first
+  while node != null
+    let manifest = node.snapshot.manifest
+    if manifest == null
+      return null
+    end
+    let entry = jsonObject()
+    entry.key = node.name
+    entry.add(jsonString(manifest.get("version").value, "version"))
+    entry.add(jsonString(node.snapshot.integrity, "integrity"))
+    let source = jsonObject()
+    source.key = "source"
+    source.add(jsonString(relativePath(graph.rootPath, node.origin), "path"))
+    entry.add(source)
+    let dependencies = canonicalJson(node.dependencies)
+    dependencies.key = "dependencies"
+    entry.add(dependencies)
+    packages.add(entry)
+    node = node.next
+  end
+  lock.add(packages)
+  return canonicalJson(lock)
+end
+
+# Only publish after the entire graph has resolved successfully.
+def publishGraph(home: String, graph: PackageGraph): String
+  if graph.error != ""
+    return graph.error
+  end
+  var node = graph.first
+  while node != null
+    let stored = cachePublish(home, node.snapshot)
+    if stored.error != ""
+      return stored.error
+    end
+    node = node.next
+  end
+  return ""
+end

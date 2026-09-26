@@ -1,0 +1,139 @@
+use host
+namespace ito
+
+# Return independent trees so failed transactions cannot mutate caller manifests.
+def objectWith(object: Json, key: String, value: Json): Json
+  let result = jsonObject()
+  var field = object.first
+  while field != null
+    if field.key != key
+      result.add(canonicalJson(field))
+    end
+    field = field.next
+  end
+  let replacement = canonicalJson(value)
+  replacement.key = key
+  result.add(replacement)
+  return canonicalJson(result)
+end
+
+def objectWithout(object: Json, key: String): Json
+  let result = jsonObject()
+  var field = object.first
+  while field != null
+    if field.key != key
+      result.add(canonicalJson(field))
+    end
+    field = field.next
+  end
+  return canonicalJson(result)
+end
+
+def mergeGraph(target: PackageGraph, source: PackageGraph): Void
+  if target.error != ""
+    return
+  end
+  if source.error != ""
+    target.error = source.error
+    return
+  end
+  var node = source.first
+  while node != null
+    let existing = target.get(node.name)
+    if existing != null
+      if existing.snapshot.integrity != node.snapshot.integrity || jsonStringify(existing.dependencies) != jsonStringify(node.dependencies)
+        target.error = "selective update conflicts with locked dependency: " + node.name + "; update the other dependents together or run ito update"
+        return
+      end
+    else
+      if target.count >= 256
+        target.error = "updated graph exceeds 256 packages"
+        return
+      end
+      let copy = new PackageNode(node.name, node.origin, node.snapshot)
+      copy.dependencies = canonicalJson(node.dependencies)
+      copy.origins = canonicalJson(node.origins)
+      target.insert(copy)
+    end
+    node = node.next
+  end
+end
+
+# Selected direct dependencies refresh with their closure. Other direct roots
+# retain their locked closures, even if their live source directories changed.
+# Removed roots are pruned; adding a root requires selecting it explicitly.
+def updateGraph(home: String, root: Json, rootPath: String, lock: Json, selected: Json): PackageGraph
+  let result = new PackageGraph(root, rootPath)
+  result.error = validateManifest(root)
+  if result.error != ""
+    return result
+  end
+  let previousRoot = objectWith(root, "dependencies", lock.get("root").get("dependencies"))
+  result.error = validateLock(lock, previousRoot)
+  if result.error != ""
+    return result
+  end
+  result.error = validateStrings(selected, false)
+  if selected.kind != "array" && result.error == ""
+    result.error = "selected updates must be an array"
+  end
+  if result.error != ""
+    return result
+  end
+  let declarations = declarationObject(root.get("dependencies"))
+  var selection = selected.first
+  while selection != null
+    if declarations.get(selection.value).kind == "missing"
+      result.error = "unknown direct dependency to update: " + selection.value
+      return result
+    end
+    selection = selection.next
+  end
+  let preserved = jsonObject()
+  let refreshed = jsonObject()
+  let reached = jsonArray()
+  let packages = lock.get("packages")
+  var declaration = declarations.first
+  while declaration != null
+    if stringMember(selected, declaration.key)
+      refreshed.add(canonicalJson(declaration))
+    else
+      let old = lock.get("root").get("dependencies").get(declaration.key)
+      if jsonStringify(canonicalJson(old)) != jsonStringify(canonicalJson(declaration))
+        result.error = "changed dependency must be explicitly selected for update: " + declaration.key
+        return result
+      end
+      preserved.add(canonicalJson(declaration))
+      result.error = lockReachable(packages, declaration.key, "/", reached, 0)
+      if result.error != ""
+        return result
+      end
+    end
+    declaration = declaration.next
+  end
+  let retainedPackages = jsonObject()
+  var entry = packages.first
+  while entry != null
+    if stringMember(reached, entry.key)
+      retainedPackages.add(canonicalJson(entry))
+    end
+    entry = entry.next
+  end
+  let retainedRoot = objectWith(root, "dependencies", preserved)
+  let retainedLockRoot = objectWith(lock.get("root"), "dependencies", preserved)
+  let retainedLock = objectWith(objectWith(lock, "root", retainedLockRoot), "packages", retainedPackages)
+  let pinned = restoreGraph(home, retainedRoot, rootPath, retainedLock)
+  if pinned.error != ""
+    result.error = pinned.error
+    return result
+  end
+  let fresh = resolveGraph(objectWith(root, "dependencies", refreshed), rootPath)
+  # Prefer freshly selected origins when an identical instance is shared.
+  mergeGraph(result, fresh)
+  mergeGraph(result, pinned)
+  let updatedLock = graphLock(result)
+  if result.error == "" && updatedLock != null
+    result.error = validateLock(updatedLock, root)
+  end
+  return result
+end

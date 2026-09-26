@@ -1,0 +1,83 @@
+use ito
+use host
+use files
+use test
+use console
+
+def check(stored: ito::StoredPackage): Void
+  if stored.error != ""
+    console::println(stored.error)
+  end
+  test::assertEqual(stored.error, "")
+  test::assertTrue(!stored.missing)
+  test::assertTrue(stored.snapshot != null)
+end
+
+def main(): Void
+  let root = host::argumentAt(0)
+  let mode = host::argumentAt(1)
+  if root == null || mode == null
+    test::assertTrue(false)
+    return
+  end
+  let home = root + "/store-" + mode
+  let snapshot = ito::readSnapshot(root + "/base")
+  test::assertEqual(snapshot.error, "")
+  let missing = ito::cacheRead(home, "fixture", "0.1.0", snapshot.integrity)
+  test::assertTrue(missing.missing)
+  let installed = ito::cachePublish(home, snapshot)
+  check(installed)
+  let reused = ito::cachePublish(home, snapshot)
+  check(reused)
+  test::assertEqual(installed.path, reused.path)
+  check(ito::cacheRestore(home, root + "/nonexistent", "fixture", "0.1.0", snapshot.integrity))
+  let modified = ito::readSnapshot(root + "/changed")
+  let separate = ito::cachePublish(home, modified)
+  check(separate)
+  test::assertTrue(installed.path != separate.path)
+  check(ito::cacheRead(home, "fixture", "0.1.0", snapshot.integrity))
+  test::assertTrue(ito::cacheRead(home, "../escape", "0.1.0", snapshot.integrity).error != "")
+  test::assertTrue(ito::cacheRead(home, "fixture", "0.1.0", "sha256:../../").error != "")
+  let restoreHome = home + "/restore"
+  test::assertTrue(ito::cacheRestore(restoreHome, root + "/changed", "fixture", "0.1.0", snapshot.integrity).error != "")
+  test::assertTrue(ito::cacheRead(restoreHome, "fixture", "0.1.0", snapshot.integrity).missing)
+  let restored = ito::cacheRestore(restoreHome, root + "/relocated", "fixture", "0.1.0", snapshot.integrity)
+  check(restored)
+  test::assertEqual(ito::readSnapshot(restored.path).integrity, snapshot.integrity)
+  test::assertEqual(ito::writeAtomic(installed.path + "/src/a.hk", "# tampered"), 0)
+  test::assertTrue(ito::cacheRead(home, "fixture", "0.1.0", snapshot.integrity).error != "")
+  test::assertTrue(ito::cachePublish(home, snapshot).error != "")
+  test::assertTrue(ito::cacheRestore(home, root + "/base", "fixture", "0.1.0", snapshot.integrity).error != "")
+  let tampered = host::readText(installed.path + "/src/a.hk")
+  test::assertTrue(tampered != null)
+  if tampered != null
+    test::assertEqual(tampered, "# tampered")
+  end
+  # Captured bytes, not a reread of the live origin, are published.
+  let captured = ito::readSnapshot(root + "/relocated")
+  let originFile = root + "/relocated/src/a.hk"
+  let original = host::readText(originFile)
+  test::assertEqual(ito::writeAtomic(originFile, "# subsequent source edit"), 0)
+  let frozen = ito::cachePublish(home + "/captured", captured)
+  check(frozen)
+  test::assertEqual(ito::readSnapshot(frozen.path).integrity, captured.integrity)
+  if original != null
+    test::assertEqual(ito::writeAtomic(originFile, original), 0)
+  end
+  # Empty declared directories survive staging even though only file bytes are hashed.
+  let emptyRoot = home + "/empty-origin"
+  test::assertEqual(ito::fs(1, emptyRoot + "/empty"), 0)
+  test::assertEqual(ito::writeAtomic(emptyRoot + "/package.json", "{\"name\":\"empty\",\"version\":\"0.1.0\",\"neri\":{\"units\":{\"core\":{\"sources\":[\"empty\"]}}}}"), 0)
+  check(ito::cachePublish(home, ito::readSnapshot(emptyRoot)))
+  let parent = files::Root.open(ito::directoryName(installed.path)).root
+  test::assertTrue(parent != null)
+  if parent != null
+    let listed = parent.list("")
+    test::assertTrue(listed.failure == null)
+    for entry in listed.entries
+      test::assertTrue(host::stringSlice(entry.name, 0, 7) != ".stage-")
+    end
+    test::assertTrue(parent.close() == null)
+  end
+  console::println("Ito cache contracts passed")
+end

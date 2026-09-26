@@ -1,0 +1,290 @@
+use host
+use files
+namespace ito
+
+class ApplicationSources
+  public snapshot: Snapshot = new Snapshot()
+  public entry: Json = jsonArray()
+  public application: Json = jsonArray()
+  public tests: Json = jsonArray()
+end
+
+def conventionalSources(configured: Json, entries: files::DirectoryEntry[], name: String): Json
+  if configured.kind != "missing"
+    return configured
+  end
+  let result = jsonArray()
+
+  for entry in entries
+    if entry.name == name
+      result.add(jsonString(name))
+    end
+  end
+  return result
+end
+
+def collectApplication(project: String, manifest: Json): ApplicationSources
+  let result = new ApplicationSources()
+  let snapshot = result.snapshot
+
+  snapshot.manifest = manifest
+  let opened = files::Root.open(project).root
+
+  if opened == null
+    snapshot.error = "cannot open application sources"
+    return result
+  end
+  let entries = opened.list("")
+
+  if entries.failure != null || entries.closeFailure != null
+    snapshot.error = "cannot enumerate application directory"
+  end
+  let config = manifest.get("neri")
+  let sources = conventionalSources(config.get("sources"), entries.entries, "app")
+  let tests = conventionalSources(config.get("tests"), entries.entries, "tests")
+  var entry = "main.hk"
+
+  if config.get("entry").kind == "string"
+    entry = config.get("entry").value
+  end
+  let entryLength = host::stringByteLength(entry)
+
+  if entryLength < 3 || host::stringSlice(entry, entryLength - 3, 3) != ".hk"
+    snapshot.error = "neri.entry must name a .hk file"
+  end
+  if snapshot.error == ""
+    payloadRead(opened, "package.json", snapshot)
+    let captured = snapshot.first
+
+    if snapshot.error == "" && captured != null
+      let text = host::stringFromBytes(captured.bytes)
+
+      if text != null
+        let parsed = parseJson(text)
+
+        if parsed == null || jsonStringify(canonicalJson(parsed)) != jsonStringify(canonicalJson(manifest))
+          snapshot.error = "package.json changed during compilation preparation"
+        end
+      end
+    end
+    if snapshot.error == ""
+      payloadRead(opened, entry, snapshot)
+      result.entry.add(jsonString(entry))
+    end
+  end
+  let excluded = jsonArray()
+
+  for selection in [sources, tests]
+    var path = selection.first
+
+    while path != null && snapshot.error == ""
+      payloadSource(opened, path.value, excluded, snapshot)
+      path = path.next
+    end
+  end
+  if opened.close() != null && snapshot.error == ""
+    snapshot.error = "cannot close application source directory"
+  end
+  if snapshot.error == ""
+    result.application = unitFiles(snapshot, sources, excluded)
+    result.tests = unitFiles(snapshot, tests, excluded)
+    snapshotHash(snapshot)
+  end
+  return result
+end
+
+def verifySourceView(path: String, expected: Snapshot): String
+  let root = files::Root.open(path).root
+
+  if root == null
+    return "cannot open generated source view"
+  end
+  let actual = new Snapshot()
+  var file = expected.first
+
+  while file != null && actual.error == ""
+    payloadRead(root, file.path, actual)
+    file = file.next
+  end
+  if root.close() != null && actual.error == ""
+    actual.error = "cannot close generated source view"
+  end
+  if actual.error == ""
+    snapshotHash(actual)
+  end
+  if actual.error != "" || actual.integrity != expected.integrity
+    return "generated application sources do not match the current snapshot"
+  end
+  return ""
+end
+
+def writeApplicationSnapshot(target: String, snapshot: Snapshot): String
+  if fs(1, target) != 0
+    return "cannot create application source view directory"
+  end
+  var directory = snapshot.directories.first
+  while directory != null
+    if fs(1, target + "/" + directory.value) != 0
+      return "cannot create source directory in application view"
+    end
+    directory = directory.next
+  end
+  var file = snapshot.first
+  while file != null
+    let destination = target + "/" + file.path
+    if fs(1, directoryName(destination)) != 0 || fsBytes(2, destination, "", file.bytes) != 0
+      return "cannot write captured application source: " + file.path
+    end
+    file = file.next
+  end
+  return ""
+end
+
+def prepareSourceView(project: String, snapshot: Snapshot): CompilationView
+  let result = new CompilationView()
+
+  if snapshot.error != "" || !digestIdentity(snapshot.integrity)
+    result.error = "cannot generate an invalid application snapshot"
+    return result
+  end
+  let parent = project + "/.neri/ito/snapshots"
+
+  result.path = parent + "/" + host::stringSlice(snapshot.integrity, 7, 64)
+  let opened = files::Root.open(result.path)
+  let existing = opened.root
+
+  if existing != null
+    if existing.close() != null
+      result.error = "cannot close application source view"
+    else
+      result.error = verifySourceView(result.path, snapshot)
+    end
+    return result
+  end
+  let failure = opened.failure
+
+  if (existing == null && (failure == null || failure.osCode != 2)) || fs(1, parent) != 0
+    result.error = "cannot prepare application source view directory"
+    return result
+  end
+  # The project lock serializes app view generation; the name is private to Ito.
+  let stage = parent + "/.stage-" + host::stringSlice(snapshot.integrity, 7, 64)
+
+  if fs(9, stage) != 0
+    result.error = "application staging directory already exists or cannot be created: " + stage
+    return result
+  end
+  result.error = writeApplicationSnapshot(stage, snapshot)
+  if result.error == ""
+    result.error = verifySourceView(stage, snapshot)
+  end
+  if result.error == "" && fs(4, stage, result.path) == 0
+    return result
+  end
+  if result.error == ""
+    result.error = "cannot publish application source view"
+  end
+  if !removeStage(stage)
+    result.error = result.error + "; staging cleanup failed: " + stage
+  end
+  return result
+end
+
+def applicationUnit(name: String, kind: String, paths: Json, sourcePrefix: String, references: Json): Json
+  let unit = jsonObject()
+
+  unit.key = name
+  unit.add(jsonString(kind, "kind"))
+  let sources = jsonArray()
+
+  sources.key = "sources"
+  var path = paths.first
+
+  while path != null
+    sources.add(jsonString(sourcePrefix + "/" + path.value))
+    path = path.next
+  end
+  unit.add(sources)
+  let refs = canonicalJson(references)
+
+  refs.key = "references"
+  unit.add(refs)
+  return unit
+end
+
+def applicationManifestMatches(directory: String, expected: String): Bool
+  let opened = files::Root.open(directory)
+  let root = opened.root
+
+  if root == null
+    return false
+  end
+  let read = root.readBytes("manifest.json", 4194304)
+  let closed = root.close()
+
+  if read.failure != null || read.closeFailure != null || closed != null
+    return false
+  end
+  let bytes = read.bytes
+
+  if bytes == null
+    return false
+  end
+  let text = host::stringFromBytes(bytes)
+
+  return text != null && text == expected
+end
+
+def prepareApplicationView(home: String, graph: PackageGraph): CompilationView
+  let result = new CompilationView()
+  let shared = prepareGraphView(home, graph)
+
+  if shared.error != ""
+    result.error = shared.error
+    return result
+  end
+  let sources = collectApplication(graph.rootPath, graph.root)
+
+  if sources.snapshot.error != ""
+    result.error = sources.snapshot.error
+    return result
+  end
+  let view = prepareSourceView(graph.rootPath, sources.snapshot)
+
+  if view.error != ""
+    result.error = view.error
+    return result
+  end
+  let root = graph.rootPath + "/.neri/ito"
+  let sourcePrefix = relativePath(root, view.path)
+  let sourceMap = jsonObject()
+
+  sourceMap.key = "sourceMap"
+  sourceMap.add(jsonString(relativePath(root, graph.rootPath), sourcePrefix))
+  let dependencies = packageReferences(graph, graph.root.get("dependencies"), root, shared.path + "/packages")
+  let references = canonicalJson(dependencies)
+  let units = jsonObject()
+
+  units.key = "units"
+  if sources.application.first != null
+    units.add(applicationUnit("app", "library", sources.application, sourcePrefix, dependencies))
+    references.add(jsonString("app"))
+  end
+  units.add(applicationUnit("web", "executable", sources.entry, sourcePrefix, references))
+  if sources.tests.first != null
+    units.add(applicationUnit("test", "executable", sources.tests, sourcePrefix, references))
+  end
+  let manifest = jsonObject()
+
+  manifest.add(jsonNumber("2", "version"))
+  manifest.add(jsonString("web", "defaultUnit"))
+  manifest.add(sourceMap)
+  manifest.add(units)
+  result.path = root + "/manifest.json"
+  let contents = jsonPretty(canonicalJson(manifest)) + "\n"
+
+  if !applicationManifestMatches(root, contents) && writeAtomic(result.path, contents) != 0
+    result.error = "cannot write application compilation manifest"
+  end
+  return result
+end

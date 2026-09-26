@@ -1,0 +1,60 @@
+use ito
+use host
+use test
+use console
+
+def main(): Void
+  let root = host::argumentAt(0)
+  test::assertTrue(root != null)
+  if root == null
+    return
+  end
+  let mode = host::argumentAt(1)
+  if mode == null
+    return
+  end
+  let home = root + "/os-" + mode
+  test::assertEqual(ito::fs(1, home + "/a/b"), 0)
+  test::assertEqual(ito::fs(1, home + "/a/b"), 0)
+  test::assertTrue(ito::fs(1, home + "/../escape") != 0)
+  test::assertTrue(ito::fs(1, home + "/unexpected/../escape") != 0)
+  test::assertTrue(ito::fs(7, home + "/unexpected") != 0)
+  test::assertEqual(ito::writeAtomic(home + "/file", "old"), 0)
+  test::assertEqual(ito::writeAtomic(home + "/file", "new"), 0)
+  assertFile(home + "/file", "new")
+  let bytes = ito::pathBytes("exclusive")
+  if bytes != null
+    test::assertEqual(ito::fsBytes(2, home + "/exclusive", "", bytes), 0)
+    test::assertTrue(ito::fsBytes(2, home + "/exclusive", "", bytes) != 0)
+    assertFile(home + "/exclusive", "exclusive")
+  end
+  test::assertEqual(ito::fs(5, home + "/exclusive", home + "/linked"), 0)
+  assertFile(home + "/linked", "exclusive")
+  test::assertEqual(ito::fs(1, home + "/staged"), 0)
+  test::assertEqual(ito::writeAtomic(home + "/staged/file", "payload"), 0)
+  test::assertEqual(ito::fs(4, home + "/staged", home + "/published"), 0)
+  test::assertEqual(ito::fs(1, home + "/staged"), 0)
+  test::assertTrue(ito::fs(4, home + "/staged", home + "/published") != 0)
+  assertFile(home + "/published/file", "payload")
+  let held = ito::lockProject(home + "/project.lock")
+  test::assertTrue(held >= 0)
+  test::assertTrue(ito::lockProject(home + "/project.lock") < 0)
+  test::assertEqual(ito::unlockProject(held), 0)
+  let again = ito::lockProject(home + "/project.lock")
+  test::assertTrue(again >= 0)
+  test::assertEqual(ito::unlockProject(again), 0)
+  test::assertTrue(ito::writeAtomic(root + "/parent-link/src/unwanted", "bad") != 0)
+  test::assertTrue(host::readText(root + "/base/src/unwanted") == null)
+  test::assertEqual(ito::fs(6, home + "/linked"), 0)
+  test::assertEqual(ito::fs(7, home + "/staged"), 0)
+  test::assertEqual(ito::fs(6, home + "/exclusive"), 0)
+  console::println("Ito OS primitive contracts passed")
+end
+
+def assertFile(path: String, expected: String): Void
+  let text = host::readText(path)
+  test::assertTrue(text != null)
+  if text != null
+    test::assertEqual(text, expected)
+  end
+end

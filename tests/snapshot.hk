@@ -1,0 +1,40 @@
+use ito
+use host
+use test
+use console
+
+def main(): Void
+  let argument = host::argumentAt(0)
+  test::assertTrue(argument != null)
+  if argument == null
+    return
+  end
+  let baseline = ito::readSnapshot(argument + "/base")
+  if baseline.error != ""
+    console::println(baseline.error)
+  end
+  test::assertEqual(baseline.error, "")
+  test::assertEqual(baseline.count, 3)
+  test::assertEqual(host::stringByteLength(baseline.integrity), 71)
+  let relocated = ito::readSnapshot(argument + "/relocated")
+  test::assertEqual(relocated.error, "")
+  test::assertEqual(baseline.integrity, relocated.integrity)
+  let changed = ito::readSnapshot(argument + "/changed")
+  test::assertEqual(changed.error, "")
+  test::assertTrue(baseline.integrity != changed.integrity)
+  let renamed = ito::readSnapshot(argument + "/renamed")
+  test::assertEqual(renamed.error, "")
+  test::assertTrue(baseline.integrity != renamed.integrity)
+  let metadata = ito::readSnapshot(argument + "/metadata")
+  test::assertEqual(metadata.error, "")
+  test::assertTrue(baseline.integrity != metadata.integrity)
+  let excluded = ito::readSnapshot(argument + "/excluded")
+  test::assertEqual(excluded.error, "")
+  test::assertEqual(baseline.integrity, excluded.integrity)
+  for name in ["link", "parent-link", "root-link", "invalid-utf8", "oversized", "missing", "invalid-manifest", "many"]
+    let bad = ito::readSnapshot(argument + "/" + name)
+    test::assertTrue(bad.error != "")
+    test::assertEqual(bad.integrity, "")
+  end
+  console::println("Ito snapshot contracts passed")
+end

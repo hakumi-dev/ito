@@ -1,0 +1,32 @@
+use ito
+use files
+use host
+use test
+use console
+
+def main(): Void
+  let source = host::argumentAt(0)
+  let home = host::argumentAt(1)
+  if source == null || home == null
+    test::assertTrue(false)
+    return
+  end
+  let snapshot = ito::readSnapshot(source)
+  let published = ito::cachePublish(home, snapshot)
+  if published.error != ""
+    console::println(published.error)
+  end
+  test::assertEqual(published.error, "")
+  test::assertTrue(published.snapshot != null)
+  if host::argumentCount() == 3
+    let opened = files::Root.open(ito::directoryName(published.path)).root
+    test::assertTrue(opened != null)
+    if opened != null
+      let listed = opened.list("")
+      test::assertTrue(listed.failure == null)
+      test::assertEqual(listed.entries.Length, 1)
+      test::assertTrue(opened.close() == null)
+    end
+  end
+  console::println("Ito concurrent cache publication passed")
+end

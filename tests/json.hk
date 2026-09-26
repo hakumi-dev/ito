@@ -1,0 +1,38 @@
+use ito
+use host
+use test
+use console
+
+def main(): Void
+  let text = "{\"name\":\"sumi\",\"dependencies\":{\"leaf\":{\"path\":\"../leaf\"}},\"unicode\":\"水\\uD83D\\uDE00\"}"
+  let parsed = ito::parseJson(text)
+  test::assertTrue(parsed != null)
+  if parsed != null
+    test::assertEqual(parsed.get("name").value, "sumi")
+    test::assertEqual(parsed.get("dependencies").get("leaf").get("path").value, "../leaf")
+    test::assertEqual(parsed.get("unicode").value, "水😀")
+    let serialized = ito::jsonStringify(parsed)
+    let roundTrip = ito::parseJson(serialized)
+    test::assertTrue(roundTrip != null)
+    if roundTrip != null
+      test::assertEqual(roundTrip.get("unicode").value, "水😀")
+    end
+  end
+  for invalid in ["{\"name\":1,\"name\":2}", "{\"name\":1,}", "{} trailing", "{\"x\":NaN}", "{\"x\":01}", "{\"x\":\"\\uD800\"}", "{\"x\":\"\\uDC00\"}", "[1,]", "", "{\"nested\":{\"a\":1,\"a\":2}}"]
+    test::assertTrue(ito::parseJson(invalid) == null)
+  end
+  var deep = "0"
+  for level in [1, 2, 3, 4, 5, 6, 7]
+    deep = "[" + deep + "]"
+    deep = "[" + deep + "]"
+  end
+  test::assertTrue(ito::parseJson(deep) != null)
+  var nesting = 0
+  while nesting < 65
+    deep = "[" + deep + "]"
+    nesting = nesting + 1
+  end
+  test::assertTrue(ito::parseJson(deep) == null)
+  test::assertEqual(ito::jsonQuote("a\n\"b"), "\"a\\u000a\\\"b\"")
+  console::println("Ito JSON contracts passed")
+end

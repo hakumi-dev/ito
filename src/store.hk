@@ -1,0 +1,200 @@
+use host
+use files
+use crypto
+namespace ito
+
+class StoredPackage
+  public path: String = ""
+  public snapshot: Snapshot?
+  public missing: Bool = false
+  public error: String = ""
+end
+
+def digestIdentity(value: String): Bool
+  if host::stringByteLength(value) != 71 || host::stringSlice(value, 0, 7) != "sha256:"
+    return false
+  end
+  var index = 7
+  while index < 71
+    let byte = host::stringByteAt(value, index) as Int
+    if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102))
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def cacheRead(home: String, name: String, version: String, integrity: String): StoredPackage
+  let result = new StoredPackage()
+  if !packageName(name) || !packageVersion(version) || !digestIdentity(integrity)
+    result.error = "invalid locked package identity"
+    return result
+  end
+  result.path = home + "/packages/" + name + "/" + version + "/" + host::stringSlice(integrity, 7, 64)
+  let probe = files::Root.open(result.path)
+  let opened = probe.root
+  if opened == null
+    let failure = probe.failure
+    if failure != null && failure.osCode == 2
+      result.missing = true
+    else
+      result.error = "cannot inspect cache directory: " + result.path
+    end
+    return result
+  end
+  if opened.close() != null
+    result.error = "cannot close cache directory: " + result.path
+    return result
+  end
+  let snapshot = readSnapshot(result.path)
+  let manifest = snapshot.manifest
+  if snapshot.error != "" || snapshot.integrity != integrity || manifest == null
+    result.error = "cache integrity check failed: " + result.path
+    return result
+  end
+  if manifest.get("name").value != name || manifest.get("version").value != version
+    result.error = "cache package identity does not match the lock: " + result.path
+    return result
+  end
+  result.snapshot = snapshot
+  return result
+end
+
+def directoryName(path: String): String
+  var index = host::stringByteLength(path) - 1
+  while index > 0 && host::stringByteAt(path, index) != 47 as Byte
+    index = index - 1
+  end
+  return host::stringSlice(path, 0, index)
+end
+
+# Only called for an exclusively created staging directory owned by this call.
+# Rooted enumeration never follows links; unlink removes the entry itself.
+def removeStage(path: String, depth: Int = 0): Bool
+  if depth > 110
+    return false
+  end
+  let opened = files::Root.open(path)
+  let root = opened.root
+  if root == null
+    return false
+  end
+  let entries = root.list("")
+  let closed = root.close()
+  if entries.failure != null || entries.closeFailure != null || closed != null
+    return false
+  end
+  for entry in entries.entries
+    let child = path + "/" + entry.name
+    if entry.kind.isDirectory()
+      if !removeStage(child, depth + 1)
+        return false
+      end
+    else
+      if fs(6, child) != 0
+        return false
+      end
+    end
+  end
+  return fs(7, path) == 0
+end
+
+def writeStage(path: String, snapshot: Snapshot): String
+  var directory = snapshot.directories.first
+  while directory != null
+    if !localPath(directory.value) || fs(1, path + "/" + directory.value) != 0
+      return "cannot create staged source directory"
+    end
+    directory = directory.next
+  end
+  var file = snapshot.first
+  while file != null
+    if !localPath(file.path)
+      return "invalid staged payload path"
+    end
+    let target = path + "/" + file.path
+    if fs(1, directoryName(target)) != 0 || fsBytes(2, target, "", file.bytes) != 0
+      return "cannot write staged source file: " + file.path
+    end
+    file = file.next
+  end
+  let verified = readSnapshot(path)
+  if verified.error != "" || verified.integrity != snapshot.integrity
+    return "staged package does not match its source snapshot"
+  end
+  return ""
+end
+
+def cachePublish(home: String, snapshot: Snapshot): StoredPackage
+  let manifest = snapshot.manifest
+  if snapshot.error != "" || manifest == null || !digestIdentity(snapshot.integrity)
+    let invalid = new StoredPackage()
+    invalid.error = "cannot publish an invalid source snapshot"
+    return invalid
+  end
+  let name = manifest.get("name").value
+  let version = manifest.get("version").value
+  let existing = cacheRead(home, name, version, snapshot.integrity)
+  if !existing.missing
+    return existing
+  end
+  existing.missing = false
+  let parent = directoryName(existing.path)
+  if fs(1, parent) != 0
+    existing.error = "cannot create package cache: " + parent
+    return existing
+  end
+  let random = crypto::randomBytes(16).bytes()
+  if random == null
+    existing.error = "cannot allocate a unique staging name"
+    return existing
+  end
+  let encoded = crypto::encodeHex(random)
+  if encoded == null
+    existing.error = "cannot encode staging name"
+    return existing
+  end
+  let stage = parent + "/.stage-" + encoded
+  if fs(9, stage) != 0
+    existing.error = "cannot acquire a fresh staging directory"
+    return existing
+  end
+  let written = writeStage(stage, snapshot)
+  if written != ""
+    existing.error = written
+    if !removeStage(stage)
+      existing.error = existing.error + "; staging cleanup failed: " + stage
+    end
+    return existing
+  end
+  let published = fs(4, stage, existing.path)
+  let result = cacheRead(home, name, version, snapshot.integrity)
+  if published != 0 && !removeStage(stage)
+    result.error = "cache publication or staging cleanup failed: " + stage
+  end
+  if result.missing
+    result.missing = false
+    result.error = "cache publication failed: " + existing.path
+  end
+  return result
+end
+
+def cacheRestore(home: String, origin: String, name: String, version: String, integrity: String): StoredPackage
+  let existing = cacheRead(home, name, version, integrity)
+  if !existing.missing
+    return existing
+  end
+  existing.missing = false
+  let snapshot = readSnapshot(origin)
+  let manifest = snapshot.manifest
+  if snapshot.error != "" || manifest == null || snapshot.integrity != integrity
+    existing.error = "locked source is unavailable or changed; restore its exact bytes or run ito update: " + origin
+    return existing
+  end
+  if manifest.get("name").value != name || manifest.get("version").value != version
+    existing.error = "source identity does not match the locked package: " + origin
+    return existing
+  end
+  return cachePublish(home, snapshot)
+end

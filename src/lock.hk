@@ -1,0 +1,181 @@
+use host
+namespace ito
+
+def declarationObject(node: Json): Json
+  if node.kind == "missing"
+    return jsonObject()
+  end
+  return canonicalJson(node)
+end
+
+def fieldNames(node: Json): Json
+  let names = jsonArray()
+  let sorted = canonicalJson(node)
+  var item = sorted.first
+  while item != null
+    names.add(jsonString(item.key))
+    item = item.next
+  end
+  return names
+end
+
+def lockReachable(packages: Json, name: String, trail: String, visited: Json, depth: Int): String
+  if trailContains(trail, name)
+    return "dependency cycle in ito.lock: " + trail + name
+  end
+  if stringMember(visited, name)
+    return ""
+  end
+  if depth > 100
+    return "ito.lock dependency depth exceeds 100"
+  end
+  let node = packages.get(name)
+  if node.kind != "object"
+    return "missing locked dependency: " + name
+  end
+  var edge = node.get("dependencies").first
+  while edge != null
+    let error = lockReachable(packages, edge.key, trail + name + "/", visited, depth + 1)
+    if error != ""
+      return error
+    end
+    edge = edge.next
+  end
+  visited.add(jsonString(name))
+  return ""
+end
+
+def validateLock(lock: Json, root: Json): String
+  let manifestError = validateManifest(root)
+  if manifestError != ""
+    return manifestError
+  end
+  if lock.kind != "object" || lock.get("lockVersion").kind != "number" || lock.get("lockVersion").value != "1"
+    return "unsupported or invalid ito.lock version"
+  end
+  let lockedRoot = lock.get("root")
+  if lockedRoot.kind != "object" || lockedRoot.get("name").kind != "string" || lockedRoot.get("dependencies").kind != "object"
+    return "invalid ito.lock root declaration"
+  end
+  if lockedRoot.get("name").value != root.get("name").value || jsonStringify(canonicalJson(lockedRoot.get("dependencies"))) != jsonStringify(declarationObject(root.get("dependencies")))
+    return "ito.lock is stale; run ito update after changing dependency declarations"
+  end
+  let packages = lock.get("packages")
+  if packages.kind != "object"
+    return "ito.lock packages must be an object"
+  end
+  var node = packages.first
+  var count = 0
+  while node != null
+    if !packageName(node.key) || node.key == root.get("name").value || node.kind != "object"
+      return "invalid locked package name: " + node.key
+    end
+    if node.get("version").kind != "string" || !packageVersion(node.get("version").value) || node.get("integrity").kind != "string" || !digestIdentity(node.get("integrity").value)
+      return "invalid locked package identity: " + node.key
+    end
+    let source = node.get("source")
+    if source.kind != "object" || source.get("path").kind != "string" || !localPath(source.get("path").value, true)
+      return "invalid locked local origin: " + node.key
+    end
+    if node.get("dependencies").kind != "object"
+      return "invalid locked dependency edges: " + node.key
+    end
+    var edge = node.get("dependencies").first
+    while edge != null
+      if !packageName(edge.key) || edge.kind != "string" || !digestIdentity(edge.value)
+        return "invalid locked dependency edge: " + node.key
+      end
+      let target = packages.get(edge.key)
+      if target.kind != "object" || target.get("integrity").value != edge.value
+        return "locked edge identity mismatch: " + node.key + " -> " + edge.key
+      end
+      edge = edge.next
+    end
+    count = count + 1
+    if count > 256
+      return "ito.lock exceeds 256 packages"
+    end
+    node = node.next
+  end
+  let visited = jsonArray()
+  var dependency = root.get("dependencies").first
+  while dependency != null
+    let error = lockReachable(packages, dependency.key, "/", visited, 0)
+    if error != ""
+      return error
+    end
+    dependency = dependency.next
+  end
+  node = packages.first
+  while node != null
+    if !stringMember(visited, node.key)
+      return "unreachable package in ito.lock: " + node.key
+    end
+    node = node.next
+  end
+  return ""
+end
+
+def restoreGraph(home: String, root: Json, rootPath: String, lock: Json): PackageGraph
+  let graph = new PackageGraph(root, rootPath)
+  graph.error = validateLock(lock, root)
+  if graph.error != ""
+    return graph
+  end
+  let packages = canonicalJson(lock.get("packages"))
+  var entry = packages.first
+  while entry != null
+    let origin = host::pathAbsolute(rootPath + "/" + entry.get("source").get("path").value)
+    if origin == null
+      graph.error = "invalid locked source path: " + entry.key
+      return graph
+    end
+    let stored = cacheRestore(home, origin, entry.key, entry.get("version").value, entry.get("integrity").value)
+    let snapshot = stored.snapshot
+    if stored.error != "" || snapshot == null
+      graph.error = "cannot restore " + entry.key + ": " + stored.error
+      return graph
+    end
+    let manifest = snapshot.manifest
+    if manifest == null
+      graph.error = "missing restored manifest: " + entry.key
+      return graph
+    end
+    if jsonStringify(fieldNames(manifest.get("dependencies"))) != jsonStringify(fieldNames(entry.get("dependencies")))
+      graph.error = "locked edges do not match package dependency declarations: " + entry.key
+      return graph
+    end
+    let node = new PackageNode(entry.key, origin, snapshot)
+    node.dependencies = canonicalJson(entry.get("dependencies"))
+    node.origins.add(jsonString(origin))
+    graph.insert(node)
+    entry = entry.next
+  end
+  return graph
+end
+
+def validateLockWrite(lock: Json, root: Json): String
+  let error = validateLock(lock, root)
+  if error != ""
+    return error
+  end
+  if host::stringByteLength(jsonStringify(lock)) + 1 > 1048576
+    return "ito.lock exceeds the 1 MiB document limit"
+  end
+  return ""
+end
+
+def persistLock(path: String, graph: PackageGraph): String
+  let lock = graphLock(graph)
+  if lock == null
+    return "cannot write an unresolved dependency lock"
+  end
+  let error = validateLockWrite(lock, graph.root)
+  if error != ""
+    return error
+  end
+  if writeAtomic(path, jsonStringify(lock) + "\n") != 0
+    return "cannot atomically write ito.lock: " + path
+  end
+  return ""
+end

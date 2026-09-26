@@ -1,0 +1,82 @@
+use host
+use console
+namespace ito
+
+@library("ito-os")
+@cabiImport("ito_exec")
+unsafe def nativeExec(path: Byte*, length: Int, directory: Byte*, directoryLength: Int): Int
+end
+
+def executeApplication(path: String, project: String): Int
+  let executable = pathBytes(path)
+  let directory = pathBytes(project)
+  if executable == null || directory == null
+    return 22
+  end
+  unsafe
+    borrow executable as p
+      borrow directory as d
+        return nativeExec(p, executable.Length, d, directory.Length)
+      end
+    end
+  end
+end
+
+def compilerCommand(command: String): Bool
+  return command == "build" || command == "run" || command == "test"
+end
+
+def applicationCommand(command: String): Bool
+  return command == "prepare" || compilerCommand(command)
+end
+
+def buildApplication(options: CliOptions, project: String, home: String, graph: PackageGraph): String
+  let view = prepareApplicationView(home, graph)
+  if view.error != ""
+    return view.error
+  end
+  var unit = "web"
+  var outputPath = project + "/build/application"
+  if options.command == "test"
+    unit = "test"
+    outputPath = project + "/build/tests"
+    let generated = readDocument(project + "/.neri/ito", "manifest.json").document
+    if generated == null || generated.get("units").get("test").kind == "missing"
+      return "no test sources; add tests/ or configure neri.tests"
+    end
+  end
+  if options.output != ""
+    if host::stringByteAt(options.output, 0) == 47 as Byte
+      outputPath = options.output
+    else
+      outputPath = project + "/" + options.output
+    end
+  end
+  let output = physicalPath(outputPath, true)
+  if output == null || fs(1, directoryName(output)) != 0
+    return "cannot prepare compiler output directory"
+  end
+  var compiler = "neri"
+  let selected = host::environment("NERI")
+  if selected != null && selected != ""
+    compiler = selected
+  end
+  var arguments: String[] = ["build", "--project", view.path, "--unit", unit, "--output", output]
+  if options.release
+    arguments = host::appendString(arguments, "--release")
+  end
+  if options.timings
+    arguments = host::appendString(arguments, "--timings")
+  end
+  let status = host::run(compiler, arguments)
+  if status == null
+    return "cannot start Neri compiler; check NERI and PATH"
+  end
+  if status != 0
+    return "Neri compilation failed"
+  end
+  if options.command == "run" || options.command == "test"
+    options.executable = output
+  end
+  return ""
+end

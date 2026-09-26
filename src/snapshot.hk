@@ -1,0 +1,270 @@
+use host
+use files
+use crypto
+use buffers
+namespace ito
+
+class PayloadFile
+  public path: String
+  public bytes: Byte[]
+  public next: PayloadFile?
+  def init(path: String, bytes: Byte[]): Void
+    this.path = path
+    this.bytes = bytes
+  end
+end
+
+class Snapshot
+  public manifest: Json?
+  public first: PayloadFile?
+  public integrity: String = ""
+  public error: String = ""
+  public count: Int = 0
+  public size: Int = 0
+  public visited: Int = 0
+  public directories: Json = jsonArray()
+
+  def contains(path: String): Bool
+    var item = this.first
+    while item != null
+      if item.path == path
+        return true
+      end
+      item = item.next
+    end
+    return false
+  end
+
+  def add(path: String, bytes: Byte[]): Void
+    if this.contains(path)
+      return
+    end
+    if this.count >= 4096 || bytes.Length > 4194304 || this.size + bytes.Length > 33554432
+      this.error = "package exceeds file count or payload size limits"
+      return
+    end
+    let item = new PayloadFile(path, bytes)
+    let first = this.first
+    if first == null || textBefore(path, first.path)
+      item.next = first
+      this.first = item
+    else
+      var cursor = first
+      var following = cursor.next
+      while following != null && !textBefore(path, following.path)
+        cursor = following
+        following = cursor.next
+      end
+      item.next = following
+      cursor.next = item
+    end
+    this.count = this.count + 1
+    this.size = this.size + bytes.Length
+  end
+end
+
+def textBefore(left: String, right: String): Bool
+  let leftSize = host::stringByteLength(left)
+  let rightSize = host::stringByteLength(right)
+  var index = 0
+  while index < leftSize && index < rightSize
+    let a = host::stringByteAt(left, index) as Int
+    let b = host::stringByteAt(right, index) as Int
+    if a != b
+      return a < b
+    end
+    index = index + 1
+  end
+  return leftSize < rightSize
+end
+
+def pathWithin(path: String, prefix: String): Bool
+  if path == prefix
+    return true
+  end
+  let length = host::stringByteLength(prefix)
+  return host::stringByteLength(path) > length && host::stringSlice(path, 0, length + 1) == prefix + "/"
+end
+
+def pathExcluded(path: String, excluded: Json): Bool
+  var item = excluded.first
+  while item != null
+    if pathWithin(path, item.value)
+      return true
+    end
+    item = item.next
+  end
+  return false
+end
+
+def payloadRead(root: files::Root, path: String, snapshot: Snapshot): Void
+  if snapshot.contains(path)
+    return
+  end
+  let read = root.readBytes(path, 4194304)
+  let bytes = read.bytes
+  if bytes == null || read.failure != null || read.closeFailure != null
+    snapshot.error = "cannot read regular source file: " + path
+    return
+  end
+  if host::stringFromBytes(bytes) == null
+    snapshot.error = "package source must be UTF-8: " + path
+    return
+  end
+  snapshot.add(path, bytes)
+end
+
+def payloadWalk(root: files::Root, path: String, kind: String, excluded: Json, snapshot: Snapshot, depth: Int): Void
+  if snapshot.error != "" || pathExcluded(path, excluded)
+    return
+  end
+  snapshot.visited = snapshot.visited + 1
+  if snapshot.visited > 65536 || depth > 100 || !localPath(path)
+    snapshot.error = "source traversal exceeds path or inventory limits: " + path
+    return
+  end
+  if kind == "file"
+    let length = host::stringByteLength(path)
+    if length >= 3 && host::stringSlice(path, length - 3, 3) == ".hk"
+      payloadRead(root, path, snapshot)
+    end
+    return
+  end
+  if kind != "directory"
+    snapshot.error = "source traversal rejects links and special files: " + path
+    return
+  end
+  if !stringMember(snapshot.directories, path)
+    snapshot.directories.add(jsonString(path))
+  end
+  let listed = root.list(path)
+  if listed.failure != null || listed.closeFailure != null
+    snapshot.error = "cannot enumerate source directory: " + path
+    return
+  end
+  for entry in listed.entries
+    payloadWalk(root, path + "/" + entry.name, entry.kind.name(), excluded, snapshot, depth + 1)
+    if snapshot.error != ""
+      return
+    end
+  end
+end
+
+def payloadSource(root: files::Root, path: String, excluded: Json, snapshot: Snapshot): Void
+  if pathExcluded(path, excluded)
+    return
+  end
+  var index = host::stringByteLength(path) - 1
+  while index >= 0 && host::stringByteAt(path, index) != 47 as Byte
+    index = index - 1
+  end
+  let parent = host::stringSlice(path, 0, index > 0 ? index : 0)
+  let name = host::stringSlice(path, index + 1, host::stringByteLength(path) - index - 1)
+  let listed = root.list(parent)
+  if listed.failure != null || listed.closeFailure != null
+    snapshot.error = "cannot inspect declared source: " + path
+    return
+  end
+  for entry in listed.entries
+    if entry.name == name
+      if entry.kind.isFile()
+        let length = host::stringByteLength(path)
+        if length < 3 || host::stringSlice(path, length - 3, 3) != ".hk"
+          snapshot.error = "declared source must be a directory or .hk file: " + path
+          return
+        end
+      end
+      payloadWalk(root, path, entry.kind.name(), excluded, snapshot, 0)
+      return
+    end
+  end
+  snapshot.error = "declared source does not exist: " + path
+end
+
+def appendLength(buffer: buffers::ByteBuffer, length: Int): Bool
+  var divisor = 72057594037927936
+  var remaining = length
+  while divisor > 0
+    let byte = remaining / divisor
+    if !buffer.append(byte as Byte)
+      return false
+    end
+    remaining = remaining - byte * divisor
+    divisor = divisor / 256
+  end
+  return true
+end
+
+def snapshotHash(snapshot: Snapshot): Void
+  let buffer = buffers::ByteBuffer.create(67108864)
+  if buffer == null
+    snapshot.error = "cannot allocate snapshot hashing buffer"
+    return
+  end
+  if !buffer.appendText("ito-source-snapshot-v1") || !buffer.append(0 as Byte)
+    snapshot.error = "cannot write snapshot hash domain"
+    return
+  end
+  var item = snapshot.first
+  while item != null
+    if !appendLength(buffer, host::stringByteLength(item.path)) || !buffer.appendText(item.path) || !appendLength(buffer, item.bytes.Length) || !buffer.appendBytes(item.bytes)
+      snapshot.error = "snapshot hash input exceeds limit"
+      return
+    end
+    item = item.next
+  end
+  let hashed = crypto::sha256(buffer.snapshot())
+  let digest = hashed.bytes()
+  if digest == null
+    snapshot.error = "SHA-256 failed"
+    return
+  end
+  let hex = crypto::encodeHex(digest)
+  if hex == null
+    snapshot.error = "cannot encode SHA-256 digest"
+    return
+  end
+  snapshot.integrity = "sha256:" + hex
+end
+
+def readSnapshot(path: String): Snapshot
+  let snapshot = new Snapshot()
+  let opened = files::Root.open(path)
+  let root = opened.root
+  if root == null
+    snapshot.error = "cannot open package root: " + path
+    return snapshot
+  end
+  payloadRead(root, "package.json", snapshot)
+  let first = snapshot.first
+  if snapshot.error == "" && first != null
+    let text = host::stringFromBytes(first.bytes)
+    if text != null
+      let manifest = parseJson(text)
+      if manifest == null
+        snapshot.error = "invalid package.json"
+      else
+        snapshot.manifest = manifest
+        snapshot.error = validateManifest(manifest, true)
+        if snapshot.error == ""
+          var unit = manifest.get("neri").get("units").first
+          while unit != null && snapshot.error == ""
+            var source = unit.get("sources").first
+            while source != null && snapshot.error == ""
+              payloadSource(root, source.value, unit.get("exclude"), snapshot)
+              source = source.next
+            end
+            unit = unit.next
+          end
+        end
+      end
+    end
+  end
+  if root.close() != null && snapshot.error == ""
+    snapshot.error = "cannot close package root"
+  end
+  if snapshot.error == ""
+    snapshotHash(snapshot)
+  end
+  return snapshot
+end

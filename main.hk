@@ -1,0 +1,6 @@
+use ito
+use host
+
+def main(): Void
+  host::exit(ito::cliMain())
+end
