@@ -21,9 +21,11 @@ export NERI_LIBRARY_PATH="$ITO_WORK${NERI_LIBRARY_PATH:+:$NERI_LIBRARY_PATH}"
 for mode in "${ITO_MODES[@]}"; do
   set --
   if [[ "$mode" == release ]]; then set -- --release; fi
-  for suite in json manifest snapshot fs store cache_race graph views; do
+  for suite in json manifest snapshot fs store cache_race graph views data_generation; do
     "${NERI:-neri}" build "$ITO_ROOT"/src/*.hk "$ITO_ROOT/tests/$suite.hk" "$@" --output "$ITO_WORK/$suite-$mode"
-    if [[ "$suite" == cache_race ]]; then
+    if [[ "$suite" == data_generation ]]; then
+      ITO_DATA_CONTRACT_ROOT="$ITO_WORK/data-generation-$mode" NERI_DATA_GENERATE="$ITO_WORK/$suite-$mode" "$ITO_WORK/$suite-$mode"
+    elif [[ "$suite" == cache_race ]]; then
       "$ITO_WORK/$suite-$mode" "$ITO_WORK/fixtures/base" "$ITO_WORK/race-$mode" > "$ITO_WORK/race-a.log" 2>&1 &
       ITO_FIRST_PID=$!
       "$ITO_WORK/$suite-$mode" "$ITO_WORK/fixtures/base" "$ITO_WORK/race-$mode" > "$ITO_WORK/race-b.log" 2>&1 &

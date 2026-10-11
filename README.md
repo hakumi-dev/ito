@@ -60,3 +60,13 @@ Missing snapshots can be restored only from identical source bytes. A lock
 provides integrity checking, not publisher authentication, and does not pin the
 compiler or promise bit-reproducible binaries. See [design contracts](docs/DESIGN.md)
 for the package schema, resolution and storage invariants.
+
+Applications using Neri Data can declare `neri.dataMappings` as an array of
+package-local mapping paths, for example `["data/mapping.json"]`. `prepare`,
+`build`, `run` and `test` invoke `neri-data-generate --ensure` for each mapping
+under the application lock before capturing sources. Include the entities and
+generated output directories in `neri.sources`. Current generated revisions are
+reused; changed inputs regenerate their owned output. Generation failures stop
+preparation before compilation. `NERI_DATA_GENERATE` selects the generator
+executable; select the generator from the same release as `NERI` and the Data
+libraries.
