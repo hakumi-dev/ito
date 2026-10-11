@@ -5,10 +5,12 @@ use console
 
 def valid(text: String, library: Bool = false): Bool
   let parsed = ito::parseJson(text)
+
   if parsed == null
     return false
   end
   let error = ito::validateManifest(parsed, library)
+
   return error == ""
 end
 
@@ -31,21 +33,53 @@ def main(): Void
   for path in ["", "/tmp/x", "../x", "a/../b", "./x", "a/", "a//b", "a\\b", "a:b", "a\n"]
     test::assertTrue(!ito::localPath(path))
   end
+
   test::assertTrue(ito::localPath("../sumi", true))
   test::assertTrue(!ito::localPath("../sumi/", true))
   test::assertTrue(valid("{\"name\":\"app\",\"version\":\"0.1.0\"}"))
   test::assertTrue(!valid("{\"name\":\"app\",\"version\":\"0.1.0\"}", true))
   let prefix = "{\"name\":\"app\",\"version\":\"0.1.0\","
-  for suffix in ["\"dependencies\":[]}", "\"dependencies\":{\"sumi\":\"../sumi\"}}", "\"dependencies\":{\"sumi\":{\"path\":\"../sumi\",\"url\":\"ignored\"}}}", "\"neri\":{\"entry\":\"../main.hk\"}}", "\"neri\":{\"sources\":[\"src\",\"src\"]}}", "\"neri\":{\"units\":{\"a\":{\"sources\":[]}}}}", "\"neri\":{\"units\":{\"a\":{\"kind\":\"executable\",\"sources\":[\"src\"]}}}}", "\"neri\":{\"units\":{\"a\":{\"sources\":[\"src\"],\"references\":[\"b\"]}}}}", "\"neri\":{\"units\":{\"a\":{\"sources\":[\"src\"],\"references\":[\"a\"]}}}}", "\"neri\":{\"units\":{\"a\":{\"sources\":[\"src\"],\"references\":[\"b\"]},\"b\":{\"sources\":[\"src\"],\"references\":[\"a\"]}}}}", "\"neri\":{\"units\":{\"a\":{\"sources\":[\"src\"]}},\"exports\":[\"b\"]}}"]
+
+  for suffix in [
+    "\"dependencies\":[]}",
+    "\"dependencies\":{\"sumi\":\"../sumi\"}}",
+    "\"dependencies\":{\"sumi\":{\"path\":\"../sumi\",\"url\":\"ignored\"}}}",
+    "\"neri\":{\"entry\":\"../main.hk\"}}",
+    "\"neri\":{\"sources\":[\"src\",\"src\"]}}",
+    "\"neri\":{\"units\":{\"a\":{\"sources\":[]}}}}",
+    "\"neri\":{\"units\":{\"a\":{\"kind\":\"executable\",\"sources\":[\"src\"]}}}}",
+    "\"neri\":{\"units\":{\"a\":{\"sources\":[\"src\"],\"references\":[\"b\"]}}}}",
+    "\"neri\":{\"units\":{\"a\":{\"sources\":[\"src\"],\"references\":[\"a\"]}}}}",
+    "\"neri\":{\"units\":{\"a\":{\"sources\":[\"src\"],\"references\":[\"b\"]},\"b\":{\"sources\":[\"src\"],\"references\":[\"a\"]}}}}",
+    "\"neri\":{\"units\":{\"a\":{\"sources\":[\"src\"]}},\"exports\":[\"b\"]}}"
+  ]
     test::assertTrue(!valid(prefix + suffix))
   end
+
   test::assertTrue(valid(prefix + "\"dependencies\":{\"sumi\":{\"path\":\"../sumi\"}}}"))
-  test::assertTrue(valid(prefix + "\"neri\":{\"units\":{\"a\":{\"sources\":[\"src\"]},\"b\":{\"sources\":[\"http\"],\"references\":[\"a\"]}},\"exports\":[\"b\"]}}", true))
+  test::assertTrue(valid(prefix + "\"neri\":{\"dataMappings\":[\"data/mapping.json\"]}}"))
+  for mappings in [
+    "null",
+    "{}",
+    "[1]",
+    "[\"../mapping.json\"]",
+    "[\"data/mapping.hk\"]",
+    "[\"data/mapping.json\",\"data/mapping.json\"]"
+  ]
+    test::assertTrue(!valid(prefix + "\"neri\":{\"dataMappings\":" + mappings + "}}"))
+  end
+
+  test::assertTrue(valid(
+      prefix + "\"neri\":{\"units\":{\"a\":{\"sources\":[\"src\"]},\"b\":{\"sources\":[\"http\"],\"references\":[\"a\"]}},\"exports\":[\"b\"]}}",
+      true
+    ))
   test::assertEqual(host::argumentCount(), 1)
   let path = host::argumentAt(0)
+
   test::assertTrue(path != null)
   if path != null
     let sumi = host::readText(path)
+
     test::assertTrue(sumi != null)
     if sumi != null
       test::assertTrue(valid(sumi, true))

@@ -19,8 +19,10 @@ def cliOptions(): CliOptions
   let result = new CliOptions()
   var index = 0
   var literal = false
+
   while index < host::argumentCount()
     let argument = host::argumentAt(index)
+
     if argument == null
       result.error = "cannot read command arguments"
       return result
@@ -30,6 +32,7 @@ def cliOptions(): CliOptions
     else if !literal && argument == "--project"
       index = index + 1
       let path = host::argumentAt(index)
+
       if path == null || path == ""
         result.error = "--project requires a directory"
         return result
@@ -44,6 +47,7 @@ def cliOptions(): CliOptions
     else if !literal && argument == "--output"
       index = index + 1
       let output = host::argumentAt(index)
+
       if output == null || output == ""
         result.error = "--output requires a path"
         return result
@@ -91,10 +95,12 @@ end
 
 def configuredHome(): String?
   let configured = host::environment("ITO_HOME")
+
   if configured != null && configured != ""
     return physicalPath(configured, true)
   end
   let home = host::environment("HOME")
+
   if home == null || home == ""
     return null
   end
@@ -106,8 +112,10 @@ def initializePackage(project: String, name: String, initial: DocumentRead): Str
     return "package.json already exists"
   end
   var chosen = name
+
   if chosen == ""
     let parts = pathParts(project)
+
     if parts.Length > 0
       chosen = parts[parts.Length - 1]
     end
@@ -116,12 +124,15 @@ def initializePackage(project: String, name: String, initial: DocumentRead): Str
     return "invalid package name; provide one with ito init <name>"
   end
   let manifest = jsonObject()
+
   manifest.add(jsonString(chosen, "name"))
   manifest.add(jsonString("0.1.0", "version"))
   let dependencies = jsonObject()
+
   dependencies.key = "dependencies"
   manifest.add(dependencies)
   let buffer = buffers::ByteBuffer.create(1048576)
+
   if buffer == null || !buffer.appendText(jsonPretty(manifest) + "\n")
     return "cannot encode package.json"
   end
@@ -134,6 +145,7 @@ end
 
 def listLocked(root: Json, lock: DocumentRead): String
   let document = lock.document
+
   if document == null
     if root.get("dependencies").first == null
       console::println("No dependencies.")
@@ -142,16 +154,19 @@ def listLocked(root: Json, lock: DocumentRead): String
     return "ito.lock is missing; run ito install"
   end
   let error = validateLock(document, root)
+
   if error != ""
     return error
   end
   let packages = canonicalJson(document.get("packages"))
   var package = packages.first
+
   if package == null
     console::println("No dependencies.")
   end
   while package != null
     var relation = "transitive"
+
     if root.get("dependencies").get(package.key).kind != "missing"
       relation = "direct"
     end
@@ -163,6 +178,7 @@ end
 
 def packageCommand(options: CliOptions, project: String): String
   let initial = readDocument(project, "package.json")
+
   if initial.error != ""
     return initial.error
   end
@@ -170,14 +186,17 @@ def packageCommand(options: CliOptions, project: String): String
     return initializePackage(project, options.argument, initial)
   end
   let original = initial.document
+
   if original == null
     return "package.json is missing; run ito init"
   end
   let manifestError = validateManifest(original)
+
   if manifestError != ""
     return manifestError
   end
   var locked = new DocumentRead()
+
   if !(options.command == "update" && options.argument == "")
     locked = readDocument(project, "ito.lock")
     if locked.error != ""
@@ -187,34 +206,47 @@ def packageCommand(options: CliOptions, project: String): String
   if options.command == "list"
     return listLocked(original, locked)
   end
+  if applicationCommand(options.command)
+    let generationError = prepareDataMappings(project, original)
+
+    if generationError != ""
+      return generationError
+    end
+  end
   let home = configuredHome()
+
   if home == null
     return "cannot resolve ITO_HOME or HOME"
   end
   var root = original
   let selected = jsonArray()
   var declarationChanged = false
+
   if options.command == "add"
     if options.argument == ""
       return "usage: ito add <local-path>"
     end
     let origin = host::pathAbsolute(project + "/" + options.argument)
+
     if origin == null
       return "invalid dependency path"
     end
     let snapshot = readSnapshot(origin)
     let dependencyManifest = snapshot.manifest
+
     if snapshot.error != "" || dependencyManifest == null
       return "cannot add package: " + snapshot.error
     end
     let name = dependencyManifest.get("name").value
     let declaration = jsonObject()
+
     declaration.add(jsonString(relativePath(project, origin), "path"))
     root = objectWith(root, "dependencies", objectWith(declarationObject(root.get("dependencies")), name, declaration))
     selected.add(jsonString(name))
     declarationChanged = true
   else if options.command == "remove"
     let name = options.argument
+
     if name == "" || root.get("dependencies").get(name).kind == "missing"
       return "remove requires the name of a direct dependency"
     end
@@ -225,6 +257,7 @@ def packageCommand(options: CliOptions, project: String): String
   end
   let oldLock = locked.document
   var graph = new PackageGraph(root, project)
+
   if (options.command == "install" || applicationCommand(options.command)) && oldLock != null
     graph = restoreGraph(home, root, project, oldLock)
   else if options.command == "install" && options.locked
@@ -241,14 +274,17 @@ def packageCommand(options: CliOptions, project: String): String
     return graph.error
   end
   let prospectiveLock = graphLock(graph)
+
   if prospectiveLock == null
     return "cannot persist an unresolved dependency graph"
   end
   let lockError = validateLockWrite(prospectiveLock, root)
+
   if lockError != ""
     return lockError
   end
   var nextManifest = ""
+
   if declarationChanged
     nextManifest = jsonPretty(root) + "\n"
     if host::stringByteLength(nextManifest) > 1048576
@@ -256,6 +292,7 @@ def packageCommand(options: CliOptions, project: String): String
     end
   end
   let published = publishGraph(home, graph)
+
   if published != ""
     return published
   end
@@ -264,6 +301,7 @@ def packageCommand(options: CliOptions, project: String): String
   end
   if (options.command != "install" && !applicationCommand(options.command)) || oldLock == null
     let persisted = persistLock(project + "/ito.lock", graph)
+
     if persisted != ""
       return persisted
     end
@@ -280,6 +318,7 @@ end
 
 def cliMain(): Int
   let options = cliOptions()
+
   if options.error != ""
     console::println("ito: " + options.error)
     return 2
@@ -294,6 +333,7 @@ def cliMain(): Int
   end
   if options.command == "self-install"
     let error = selfInstall(options.argument)
+
     if error != ""
       console::println("ito: " + error)
       return 1
@@ -305,6 +345,7 @@ def cliMain(): Int
     return 2
   end
   let project = physicalPath(options.project, options.command == "init")
+
   if project == null
     console::println("ito: cannot resolve project directory")
     return 1
@@ -314,11 +355,13 @@ def cliMain(): Int
     return 1
   end
   let descriptor = lockProject(project + "/.neri/ito/project.lock")
+
   if descriptor < 0
     console::println("ito: project is locked by another operation or the lock cannot be opened")
     return 1
   end
   var error = packageCommand(options, project)
+
   if unlockProject(descriptor) != 0 && error == ""
     error = "cannot release project lock"
   end

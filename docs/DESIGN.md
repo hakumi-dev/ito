@@ -20,6 +20,15 @@ package-local, regular UTF-8 `.hk` files; parent traversal and symlinks are
 rejected. Neri compilation manifests must be named `manifest.json` or
 `neri.json`, and unit sources must remain beneath the manifest root.
 
+`neri.dataMappings` lists at most 128 distinct, normalized package-local `.json`
+mapping files. Application preparation runs the selected Neri Data generator
+for each mapping before capturing sources. The project lock covers generation,
+source capture and manifest publication. Failed generation stops preparation;
+it preserves previously published compiler views. Each generator owns its
+output directory and publishes one mapping atomically; multiple mappings do
+not form a single publication transaction. Library package snapshots are
+immutable inputs and do not run application generation hooks.
+
 Application declaration:
 
 ```json

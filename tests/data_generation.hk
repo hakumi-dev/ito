@@ -1,0 +1,60 @@
+use host
+use ito
+use files
+use test
+
+def main(): Void
+  let first = host::argumentAt(0)
+
+  if first == "--ensure"
+    let mapping = host::argumentAt(1)
+
+    if host::argumentCount() != 2 || mapping == null
+      host::exit(2)
+      return
+    end
+    let text = host::readText(mapping)
+
+    if text == null || text == "fail"
+      host::exit(1)
+      return
+    end
+    host::exit(host::writeText(mapping + ".generated", text) ? 0 : 1)
+    return
+  end
+  let configured = host::environment("ITO_DATA_CONTRACT_ROOT")
+
+  test::assertTrue(configured != null)
+  if configured == null
+    return
+  end
+  let directory = configured + "/application with spaces"
+  let manifest = ito::parseJson("{\"neri\":{\"dataMappings\":[\"mapping.json\"]}}")
+
+  test::assertTrue(files::createDirectory(directory, true).failure == null)
+  test::assertTrue(host::writeText(directory + "/mapping.json", "first"))
+  test::assertTrue(manifest != null)
+  if manifest == null
+    return
+  end
+  let prepared = ito::prepareDataMappings(directory, manifest)
+  let generated = host::readText(directory + "/mapping.json.generated")
+
+  test::assertEqual(prepared, "")
+  test::assertTrue(generated == "first")
+  test::assertTrue(host::writeText(directory + "/mapping.json", "second"))
+  let refreshed = ito::prepareDataMappings(directory, manifest)
+
+  test::assertEqual(refreshed, "")
+  test::assertTrue(host::readText(directory + "/mapping.json.generated") == "second")
+  test::assertTrue(host::writeText(directory + "/mapping.json", "fail"))
+  let failed = ito::prepareDataMappings(directory, manifest)
+
+  test::assertTrue(failed != "")
+  test::assertTrue(host::readText(directory + "/mapping.json.generated") == "second")
+  test::assertTrue(files::removeFile(directory + "/mapping.json").failure == null)
+  let missing = ito::prepareDataMappings(directory, manifest)
+
+  test::assertTrue(missing != "")
+  test::assertTrue(host::readText(directory + "/mapping.json.generated") == "second")
+end

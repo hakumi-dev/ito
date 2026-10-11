@@ -1,0 +1,63 @@
+use host
+use files
+namespace ito
+
+def dataMappingText(root: files::Root, path: String): String?
+  let captured = root.readBytes(path, 1048576)
+  let bytes = captured.bytes
+
+  if captured.failure != null || captured.closeFailure != null || bytes == null
+    return null
+  end
+  return host::stringFromBytes(bytes)
+end
+
+## Generates application-owned Data sources before their source view is captured.
+def prepareDataMappings(project: String, manifest: Json): String
+  let mappings = manifest.get("neri").get("dataMappings")
+
+  if mappings.first == null
+    return ""
+  end
+  var generator = "neri-data-generate"
+  let selected = host::environment("NERI_DATA_GENERATE")
+
+  if selected != null && selected != ""
+    generator = selected
+  end
+  let opened = files::Root.open(project)
+  let root = opened.root
+
+  if opened.failure != null || root == null
+    return "cannot open application Data mappings"
+  end
+  var mapping = mappings.first
+  var error = ""
+
+  while mapping != null && error == ""
+    let before = dataMappingText(root, mapping.value)
+
+    if before == null
+      error = "cannot read application Data mapping: " + mapping.value
+    else
+      let status = host::run(generator, ["--ensure", project + "/" + mapping.value])
+
+      if status == null
+        error = "cannot start Data generator; check NERI_DATA_GENERATE and PATH"
+      else if status != 0
+        error = "Data generation failed for " + mapping.value
+      else
+        let current = dataMappingText(root, mapping.value)
+
+        if current == null || current != before
+          error = "Data mapping changed during application preparation: " + mapping.value
+        end
+      end
+    end
+    mapping = mapping.next
+  end
+  if root.close() != null && error == ""
+    error = "cannot close application Data mappings"
+  end
+  return error
+end
